@@ -12,3 +12,10 @@
 
 # Distribution
 /dist/
+
+# Git files
+.git/
+
+# Agents
+CLAUDE.md
+.claude/
