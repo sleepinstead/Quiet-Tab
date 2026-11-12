@@ -2,44 +2,72 @@
 
 A calm, minimal New Tab page for Chrome.
 
-I wanted a new tab that didn't shout at me, so I made one: a big clock, a soft dotted background, and a small toolbar with the sites I actually use. If you want more, there's a pinboard for images, sticky notes and to-do lists. If you don't, everything can be switched off.
+I wanted a new tab that didn't shout at me, so I made one. You get a big clock, a soft dotted background and a small toolbar with the sites you actually use. If you want more, there's a pinboard for images, sticky notes and to-do lists. If you don't, you can switch almost everything off.
 
-![Quiet Tab — new tab page](screenshots/new.png)
+![Quiet Tab new tab page](screenshots/new.png)
 
-## What's inside
+## Why it exists
 
-- **A clock that stays out of the way.** Set in Instrument Serif, with 12/24-hour, seconds, date and size options. You can turn it off entirely.
-- **A tiny toolbar** for your shortcuts. Add one in seconds from the **+** menu. Put it at the bottom, top, left or right with automatic overflow scrolling on compact viewports, or turn it off completely for an ultra-clean canvas with a floating corner settings button.
-- **Pinboard.** Drop, paste or upload images, add sticky notes and to-do lists. Drag, resize, rotate, and pin them in place. Double-click any handle to reset rotation or scale.
-- **Smooth page load animations.** Watch your clock, toolbar, photos, sticky notes, and to-dos gracefully rise into position with organic stagger and physical drift when opening a new tab.
-- **Dynamic scaling & multiline tasks.** Resize sticky notes and to-dos smoothly—fonts scale proportionally, and long tasks wrap cleanly onto multiple lines without clipping.
-- **Fluid keyboard navigation.** Arrow through your task lists with ease: jump between title, tasks, and the add input using `ArrowUp`, `ArrowDown`, and `Enter`.
-- **A canvas you can pan.** Drag empty space to move around, and double-click to come back.
-- **Your look.** Light or dark mode, custom colors (with hex codes), dots, grid or plain backgrounds, or your own photo with dim and blur.
-- **Multi-tab synchronization & safe backups.** Seamlessly syncs settings and shortcuts across open tabs on focus, and export everything to a single JSON backup.
-- **Guided onboarding tour.** First run walks through the clock, shortcuts, creating items, the pinboard and settings; replay it anytime from Settings → Help.
+Most new tab pages are busy. They show news, ads and things you never asked for. Quiet Tab does the opposite. It gives you a clean space to start from, with a few useful tools when you need them.
 
-## Onboarding
+## Features
 
-![Quiet Tab — onboarding](screenshots/onboard.png)
+- **Clock.** A large, simple clock with 12/24-hour time, seconds, date and size options. You can hide it too.
+- **Shortcuts toolbar.** Add your favorite sites from the **+** menu. Place the toolbar on any edge of the screen, or hide it for a fully clean page.
+- **Pinboard.** Drop, paste or upload images. Add sticky notes and to-do lists. Drag, resize, rotate and pin them where you like.
+- **Easy to-do lists.** Long tasks wrap onto new lines, and you can move between tasks with the arrow keys and Enter.
+- **Movable canvas.** Drag empty space to look around. Double-click to jump back.
+- **Your own style.** Light or dark mode, custom colors, dots, grid or plain backgrounds, or your own photo with dim and blur.
+- **Sync and backup.** Settings stay in sync across open tabs, and you can export everything to one JSON file.
+- **Quick tour.** A short guide shows you around on first run. You can replay it from Settings → Help.
 
-## Install
+## Built with
+
+- Plain HTML, CSS and JavaScript (no frameworks)
+- Chrome Extension Manifest V3
+- Bundled fonts: Instrument Serif and Inter
+
+## Getting started
 
 1. Download `quiet-tab-v1.0.0.zip` from the [Releases](../../releases) page and unzip it.
 2. Open `chrome://extensions` and turn on **Developer mode** (top right).
-3. Click **Load unpacked** and pick the `quiet-tab-v1.0.0` folder.
+3. Click **Load unpacked** and select the `quiet-tab-v1.0.0` folder.
 4. Open a new tab. That's it.
 
-Needs Chrome 111 or newer. It should also work in Edge, Brave and Arc.
+You need Chrome 111 or newer. It should also work in Edge, Brave and Arc.
+
+**Running from source:** clone this repo and load the `ext` folder with **Load unpacked** instead.
+
+## Using it
+
+- Click **+** to add a shortcut, image, sticky note or to-do list.
+- Open **Settings** to change the clock, toolbar, colors and background.
+- Double-click a rotate or resize handle to reset it.
+
+![Quiet Tab onboarding tour](screenshots/onboard.png)
 
 ## Privacy
 
-Nothing leaves your computer. There are no accounts, no analytics and no network requests. Fonts are bundled, and settings and images are stored locally in your browser. The only permissions are `storage`, `unlimitedStorage` (so photos fit) and `favicon` (to show site icons).
+Nothing leaves your computer. There are no accounts, no analytics and no network requests. Your settings and images are stored locally in your browser.
+
+The extension only asks for three permissions:
+
+- `storage` to save your settings
+- `unlimitedStorage` so your photos fit
+- `favicon` to show site icons
 
 ## Good to know
 
-- Site icons come from Chrome's own cache, so a brand-new shortcut may show a placeholder until you've visited the site once.
-- Uploaded images are resized when you add them to keep things light.
-- Double-clicking the rotate or resize handles instantly resets them to their default orientation and size.
----
-v1.0.0
+- Site icons come from Chrome's own cache. A new shortcut may show a placeholder until you visit the site once.
+- Images are resized when you add them, to keep things light.
+
+## Project structure
+
+```
+ext/           The extension (manifest, HTML, CSS, JS, fonts, icons)
+screenshots/   Images used in this README
+```
+
+## License
+
+Free to use. See [LICENSE.md](LICENSE.md).
