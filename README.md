@@ -25,9 +25,9 @@ I wanted a new tab that didn't shout at me, so I made one: a big clock, a soft d
 
 ## Install
 
-1. Download `quiet-tab-v1.1.3.zip` from the [Releases](../../releases) page and unzip it.
+1. Download `quiet-tab-v1.0.0.zip` from the [Releases](../../releases) page and unzip it.
 2. Open `chrome://extensions` and turn on **Developer mode** (top right).
-3. Click **Load unpacked** and pick the `quiet-tab-v1.1.3` folder.
+3. Click **Load unpacked** and pick the `quiet-tab-v1.0.0` folder.
 4. Open a new tab. That's it.
 
 Needs Chrome 111 or newer. It should also work in Edge, Brave and Arc.
@@ -42,4 +42,4 @@ Nothing leaves your computer. There are no accounts, no analytics and no network
 - Uploaded images are resized when you add them to keep things light.
 - Double-clicking the rotate or resize handles instantly resets them to their default orientation and size.
 ---
-v1.1.3
+v1.0.0
