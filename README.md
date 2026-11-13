@@ -45,6 +45,8 @@ You need Chrome 111 or newer. It should also work in Edge, Brave and Arc.
 - Double-click a rotate or resize handle to reset it.
 
 ![Quiet Tab onboarding tour](screenshots/onboard.png)
+![Settings](screenshots/settings.png)
+
 
 ## Privacy
 
