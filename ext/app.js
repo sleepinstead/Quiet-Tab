@@ -43,8 +43,8 @@
       store.set(Object.fromEntries(keys.map(x => [x, s[x]])));
     }
   };
+  // pagehide only: a beforeunload listener would block Chrome's back/forward cache
   window.addEventListener('pagehide', flushSave);
-  window.addEventListener('beforeunload', flushSave);
   const urls = new Map(); // blob key -> object URL (revoked on removal to free memory)
   const urlFor = async (key) => { if (urls.has(key)) return urls.get(key); const b = await blobs.get(key).catch(() => null); if (!b) return null; const u = URL.createObjectURL(b); urls.set(key, u); return u; };
   const dropUrl = (key) => { if (urls.has(key)) { URL.revokeObjectURL(urls.get(key)); urls.delete(key); } };
@@ -74,35 +74,42 @@
     }
   }
   async function syncStorage() {
-    if (typeof els === 'undefined') return;
     if (document.activeElement && document.activeElement.matches('input, textarea, [contenteditable]')) return;
+    if (Object.keys(timers).length) return; // local edits not yet written; don't clobber them
     try {
       const d = await store.get([...Object.keys(DEFAULT)]);
-      let changed = false;
+      let changed = false, boardChanged = false;
       for (const k in DEFAULT) {
-        if (d[k] !== undefined && JSON.stringify(d[k]) !== JSON.stringify(s[k])) {
-          s[k] = d[k];
-          changed = true;
-        }
-      }
-      if (changed) {
-        applyTheme(); applyBar(); applyClockOpts(); renderLinks();
-        const currentIds = new Set(s.board.map(i => i.id));
-        for (const [id, el] of els) {
-          if (!currentIds.has(id)) { el.remove(); els.delete(id); }
-        }
-        s.board.forEach(it => {
-          if (els.has(it.id)) sync(it);
-          else renderItem(it);
+        if (d[k] === undefined || JSON.stringify(d[k]) === JSON.stringify(s[k])) continue;
+        changed = true;
+        if (k !== 'board') { s[k] = d[k]; continue; }
+        if (!Array.isArray(d.board)) continue;
+        boardChanged = true;
+        // Item elements hold closures over their item objects, so keep unchanged objects
+        // and rebuild changed ones; otherwise later edits would mutate orphaned objects.
+        const old = new Map(s.board.map(i => [i.id, i]));
+        s.board = d.board.map(n => {
+          const o = old.get(n.id);
+          if (o && JSON.stringify(o) === JSON.stringify(n)) return o;
+          if (o) { els.get(n.id)?.remove(); els.delete(n.id); }
+          return n;
         });
-        applyPan(false);
+      }
+      if (!changed) return;
+      applyTheme(); applyBar(); applyClockOpts(); renderLinks(); applyBg();
+      if (boardChanged) {
+        const ids = new Set(s.board.map(i => i.id));
+        for (const [id, el] of els) if (!ids.has(id)) { el.remove(); els.delete(id); dropUrl(id); }
+        s.board.forEach(it => { if (!els.has(it.id)) renderItem(it, false); });
         updateStats();
       }
+      applyPan(false);
     } catch {}
   }
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       clearTimeout(clockT);
+      flushSave(); // write pending edits so other tabs see them
     } else {
       tick();
       syncStorage();
@@ -277,7 +284,7 @@
   const saveBoard = () => save(['board'], 300);
   const topZ = () => {
     let m = s.board.reduce((m, i) => Math.max(m, i.z || 0), 0);
-    if (m > 5000) { [...s.board].sort((a, b) => a.z - b.z).forEach((it, i) => { it.z = i + 1; const el = els.get(it.id); if (el) el.style.zIndex = it.z; }); m = s.board.length; }
+    if (m > 5000) { [...s.board].sort((a, b) => (a.z || 0) - (b.z || 0)).forEach((it, i) => { it.z = i + 1; const el = els.get(it.id); if (el) el.style.zIndex = it.z; }); m = s.board.length; }
     return m + 1;
   };
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -287,12 +294,21 @@
     let el = els.get(it.id);
     if (!el) {
       el = document.createElement('div'); el.className = 'item ' + (it.type === 'todo' ? 'note todo' : it.type);
-      el.classList.add('item-enter');
-      if (typeof i === 'number' && i >= 0) el.style.setProperty('--item-delay', Math.min(0.42, +(0.06 + i * 0.05).toFixed(2)) + 's');
-      else el.style.setProperty('--item-delay', '0s');
-      const endEnter = (e) => { if (e.target !== el || e.animationName !== 'item-rise') return; el.classList.remove('item-enter'); el.removeEventListener('animationend', endEnter); };
-      el.addEventListener('animationend', endEnter);
-      if (it.type === 'img') { const img = new Image(); img.alt = ''; img.decoding = 'async'; img.draggable = false; img.src = await urlFor(it.id) || ''; el.append(img); }
+      // Register right away so a second render call (e.g. a storage sync during an
+      // image load) can't create a duplicate element for the same item.
+      els.set(it.id, el);
+      if (i !== false) {
+        el.classList.add('item-enter');
+        el.style.setProperty('--item-delay', typeof i === 'number' && i >= 0 ? Math.min(0.42, +(0.06 + i * 0.05).toFixed(2)) + 's' : '0s');
+        const endEnter = (e) => { if (e.target !== el || e.animationName !== 'item-rise') return; el.classList.remove('item-enter'); el.removeEventListener('animationend', endEnter); };
+        el.addEventListener('animationend', endEnter);
+      }
+      if (it.type === 'img') {
+        const img = new Image(); img.alt = ''; img.decoding = 'async'; img.draggable = false; el.append(img);
+        const u = await urlFor(it.id);
+        if (els.get(it.id) !== el) return; // removed while loading
+        if (u) img.src = u; else el.classList.add('missing');
+      }
       else if (it.type === 'todo') buildTodo(el, it);
       else {
         const t = document.createElement('div'); t.contentEditable = 'plaintext-only'; t.spellcheck = false; t.textContent = it.text || '';
@@ -326,7 +342,7 @@
       el.append(mark, ctl, rs, rot);
       ctl.addEventListener('pointerdown', e => e.stopPropagation());
       dragify(el, it);
-      els.set(it.id, el); board.append(el);
+      board.append(el);
     }
     sync(it);
   }
@@ -612,7 +628,7 @@
     addRow.addEventListener('pointerdown', stop);
     function draw(focusId, atEnd) {
       list.replaceChildren();
-      it.tasks.forEach((t, i) => {
+      it.tasks.forEach((t) => {
         const li = document.createElement('li'); li.classList.toggle('done', t.done);
         const cb = document.createElement('button'); cb.type = 'button'; cb.className = 'td-check'; cb.setAttribute('role', 'checkbox'); cb.setAttribute('aria-checked', String(!!t.done));
         cb.innerHTML = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
@@ -622,6 +638,7 @@
         tx.addEventListener('input', () => { autoH(); t.text = tx.value; saveBoard(); });
         tx.addEventListener('keydown', (e) => {
           stop(e);
+          const i = it.tasks.indexOf(t); // live index: the list can change without a full redraw
           if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); const n = { id: uid(), text: '', done: false }; it.tasks.splice(i + 1, 0, n); draw(n.id); saveBoard(); }
           else if (e.key === 'Backspace' && !tx.value) { e.preventDefault(); it.tasks.splice(i, 1); const prev = it.tasks[i - 1]; draw(prev?.id, true); if (!prev) add.focus(); saveBoard(); }
           else if (e.key === 'ArrowUp') {
@@ -644,10 +661,11 @@
             }
           }
         });
-        tx.addEventListener('blur', () => { if (!t.text.trim() && it.tasks.includes(t)) { it.tasks = it.tasks.filter(x => x !== t); draw(); saveBoard(); } });
+        // Drop an empty task on blur without redrawing, so focus moving to another task survives.
+        tx.addEventListener('blur', () => { if (!t.text.trim() && it.tasks.includes(t)) { it.tasks = it.tasks.filter(x => x !== t); li.remove(); meta(); saveBoard(); } });
         const x = document.createElement('button'); x.type = 'button'; x.className = 'td-x'; x.setAttribute('aria-label', 'Delete task');
         x.innerHTML = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
-        x.onclick = () => { it.tasks = it.tasks.filter(y => y !== t); draw(); saveBoard(); };
+        x.onclick = () => { it.tasks = it.tasks.filter(y => y !== t); li.remove(); meta(); saveBoard(); };
         li.append(cb, tx, x); list.append(li);
         autoH();
         if (t.id === focusId) requestAnimationFrame(() => { tx.focus(); if (atEnd) tx.setSelectionRange(tx.value.length, tx.value.length); });
@@ -694,7 +712,7 @@
   addEventListener('dragleave', e => { if (hasFiles(e) && --dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dropping'); } });
   addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
   addEventListener('drop', e => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping'); addImages([...e.dataTransfer.files], { x: e.clientX, y: e.clientY }); });
-  addEventListener('paste', e => { if (e.target.closest?.('input,[contenteditable]')) return; const f = [...(e.clipboardData?.files || [])]; if (f.length) { e.preventDefault(); addImages(f); } });
+  addEventListener('paste', e => { if (e.target.closest?.('input,textarea,[contenteditable]')) return; const f = [...(e.clipboardData?.files || [])]; if (f.length) { e.preventDefault(); addImages(f); } });
 
   /* ---------- pannable canvas ---------- */
   const pat = $('#pattern');
@@ -946,6 +964,8 @@
     for (const k in DEFAULT) if (d[k] !== undefined) s[k] = d[k];
     if (!Array.isArray(s.board)) s.board = [];
     if (!Array.isArray(s.links)) s.links = structuredClone(DEFAULT.links);
+    // Links can arrive from an imported backup, so re-validate them before they become hrefs.
+    s.links = s.links.filter(l => l && normUrl(l.url)).map(l => ({ ...l, url: normUrl(l.url) }));
     if (typeof s.colors !== 'object' || !s.colors) s.colors = { ...PRESETS.light };
     if (typeof s.pan !== 'object' || !s.pan) s.pan = { x: 0, y: 0 };
     if (!['bottom', 'top', 'left', 'right'].includes(s.barPos)) s.barPos = 'bottom';
