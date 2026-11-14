@@ -290,7 +290,8 @@
       el.classList.add('item-enter');
       if (typeof i === 'number' && i >= 0) el.style.setProperty('--item-delay', Math.min(0.42, +(0.06 + i * 0.05).toFixed(2)) + 's');
       else el.style.setProperty('--item-delay', '0s');
-      el.addEventListener('animationend', () => el.classList.remove('item-enter'), { once: true });
+      const endEnter = (e) => { if (e.target !== el || e.animationName !== 'item-rise') return; el.classList.remove('item-enter'); el.removeEventListener('animationend', endEnter); };
+      el.addEventListener('animationend', endEnter);
       if (it.type === 'img') { const img = new Image(); img.alt = ''; img.decoding = 'async'; img.draggable = false; img.src = await urlFor(it.id) || ''; el.append(img); }
       else if (it.type === 'todo') buildTodo(el, it);
       else {
