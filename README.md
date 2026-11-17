@@ -29,9 +29,9 @@ Most new tab pages are busy. They show news, ads and things you never asked for.
 
 ## Getting started
 
-1. Download `quiet-tab-v1.0.1.zip` from the [Releases](../../releases) page and unzip it.
+1. Download `quiet-tab-v1.0.2.zip` from the [Releases](../../releases) page and unzip it.
 2. Open `chrome://extensions` and turn on **Developer mode** (top right).
-3. Click **Load unpacked** and select the `quiet-tab-v1.0.1` folder.
+3. Click **Load unpacked** and select the `quiet-tab-v1.0.2` folder.
 4. Open a new tab. That's it.
 
 You need Chrome 111 or newer. It should also work in Edge, Brave and Arc.
