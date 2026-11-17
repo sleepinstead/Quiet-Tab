@@ -81,10 +81,11 @@
       let changed = false, boardChanged = false;
       for (const k in DEFAULT) {
         if (d[k] === undefined || JSON.stringify(d[k]) === JSON.stringify(s[k])) continue;
-        changed = true;
-        if (k !== 'board') { s[k] = d[k]; continue; }
+        if (k !== 'board') { s[k] = d[k]; changed = true; continue; }
         if (!Array.isArray(d.board)) continue;
-        boardChanged = true;
+        d.board.forEach(toPx);
+        if (JSON.stringify(d.board) === JSON.stringify(s.board)) continue;
+        changed = boardChanged = true;
         // Item elements hold closures over their item objects, so keep unchanged objects
         // and rebuild changed ones; otherwise later edits would mutate orphaned objects.
         const old = new Map(s.board.map(i => [i.id, i]));
@@ -288,7 +289,37 @@
     return m + 1;
   };
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
-  const randPos = () => ({ x: 0.15 + Math.random() * 0.6 - (s.canvas ? s.pan.x / innerWidth : 0), y: 0.18 + Math.random() * 0.45 - (s.canvas ? s.pan.y / innerHeight : 0), r: +(Math.random() * 6 - 3).toFixed(1) });
+  // Item positions are canvas pixels (it.u === 'px'), so resizing the window never changes
+  // the layout. Older versions stored fractions of the viewport; toPx converts those once,
+  // using the current window so the board looks exactly as it did.
+  const toPx = (it) => {
+    if (!it || it.u === 'px') return false;
+    if (!innerWidth || !innerHeight) return false; // no real size yet (hidden/prerendered tab): retry on resize
+    it.x = Math.round((Number.isFinite(it.x) ? it.x : 0.2) * innerWidth);
+    it.y = Math.round((Number.isFinite(it.y) ? it.y : 0.2) * innerHeight);
+    it.u = 'px';
+    return true;
+  };
+  const panX = () => s.canvas ? (+s.pan?.x || 0) : 0, panY = () => s.canvas ? (+s.pan?.y || 0) : 0;
+  const randPos = () => ({ x: Math.round(innerWidth * (0.15 + Math.random() * 0.6) - panX()), y: Math.round(innerHeight * (0.18 + Math.random() * 0.45) - panY()), u: 'px', r: +(Math.random() * 6 - 3).toFixed(1) });
+  // Without the pannable canvas there's no way to reach off-screen items, so keep them in view
+  // (display only: the saved position is untouched and returns when the window grows again).
+  const place = (el, it) => {
+    if (it.u !== 'px') { el.style.left = it.x * 100 + 'vw'; el.style.top = it.y * 100 + 'vh'; return; } // not converted yet
+    let x = it.x, y = it.y;
+    if (!s.canvas) { x = clamp(x, -(it.w || 240) * 0.6, innerWidth - 40); y = clamp(y, -20, innerHeight - 40); }
+    el.style.left = x + 'px'; el.style.top = y + 'px';
+  };
+  const placeAll = () => s.board.forEach(it => { const el = els.get(it.id); if (el) place(el, it); });
+  let resizeRaf = 0;
+  addEventListener('resize', () => {
+    if (resizeRaf) return;
+    resizeRaf = requestAnimationFrame(() => {
+      resizeRaf = 0;
+      if (s.board.map(toPx).some(Boolean)) { saveBoard(); placeAll(); } // finish a conversion that had to wait for a size
+      else if (!s.canvas) placeAll();
+    });
+  });
 
   async function renderItem(it, i = -1) {
     let el = els.get(it.id);
@@ -370,9 +401,9 @@
     } else {
       it.w = Math.max(100, Math.min(1200, it.w || 240));
     }
-    if (isNaN(it.x)) it.x = 0.2;
-    if (isNaN(it.y)) it.y = 0.2;
-    el.style.left = (it.x * 100) + 'vw'; el.style.top = (it.y * 100) + 'vh';
+    if (!Number.isFinite(it.x)) it.x = it.u === 'px' ? 100 : 0.2;
+    if (!Number.isFinite(it.y)) it.y = it.u === 'px' ? 100 : 0.2;
+    place(el, it);
     el.style.width = it.w + 'px';
     el.style.zIndex = it.z || 1;
     el.style.setProperty('--r', (it.r || 0) + 'deg');
@@ -403,7 +434,8 @@
       const mode = e.target.closest('.rs') ? 'resize' : e.target.closest('.rot') ? 'rotate' : 'move';
       e.preventDefault();
       const sx = e.clientX, sy = e.clientY;
-      const ox = (isNaN(it.x) ? 0.2 : it.x) * innerWidth, oy = (isNaN(it.y) ? 0.2 : it.y) * innerHeight;
+      if (toPx(it)) place(el, it);
+      const ox = parseFloat(el.style.left) || 0, oy = parseFloat(el.style.top) || 0; // shown position (may be clamped)
       const ow = el.offsetWidth;
       const oh = it.type === 'note' ? ow : el.offsetHeight;
       const s0 = it.scale || 1;
@@ -460,13 +492,10 @@
           const dW = it.w - ow, dH = nh - oh;
           const shiftX = (dW / 2) * (1 - cosK) + (dH / 2) * sinK;
           const shiftY = (dH / 2) * (1 - cosK) - (dW / 2) * sinK;
-          const nx = (ox - shiftX) / innerWidth;
-          const ny = (oy - shiftY) / innerHeight;
-          if (!isNaN(nx) && !isNaN(ny)) {
-            it.x = nx;
-            it.y = ny;
-            el.style.left = it.x * 100 + 'vw';
-            el.style.top = it.y * 100 + 'vh';
+          const nx = Math.round(ox - shiftX), ny = Math.round(oy - shiftY);
+          if (Number.isFinite(nx) && Number.isFinite(ny)) {
+            it.x = nx; it.y = ny;
+            el.style.left = nx + 'px'; el.style.top = ny + 'px';
           }
         } else if (mode === 'rotate') {
           let r = r0 + (Math.atan2(ly - cy, lx - cx) - a0) * 180 / Math.PI;
@@ -476,10 +505,10 @@
           it.r = Math.round(r * 10) / 10;
           el.style.setProperty('--r', it.r + 'deg');
         } else {
-          it.x = (s.canvas ? ox + dx : clamp(ox + dx, -ow * 0.6, innerWidth - 40)) / innerWidth;
-          it.y = (s.canvas ? oy + dy : clamp(oy + dy, -20, innerHeight - 40)) / innerHeight;
-          el.style.left = it.x * 100 + 'vw';
-          el.style.top = it.y * 100 + 'vh';
+          it.x = Math.round(s.canvas ? ox + dx : clamp(ox + dx, -ow * 0.6, innerWidth - 40));
+          it.y = Math.round(s.canvas ? oy + dy : clamp(oy + dy, -20, innerHeight - 40));
+          el.style.left = it.x + 'px';
+          el.style.top = it.y + 'px';
         }
       };
       const mv = (ev) => {
@@ -577,7 +606,7 @@
         const blob = await shrink(f, 1400, isPng(f) ? 'image/webp' : 'image/jpeg');
         const id = 'pin_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
         await blobs.put(id, blob);
-        const pos = at ? { x: (at.x - (s.canvas ? s.pan.x : 0)) / innerWidth - 0.08, y: (at.y - (s.canvas ? s.pan.y : 0)) / innerHeight - 0.08, r: randPos().r } : randPos();
+        const pos = at ? { x: Math.round(at.x - panX() - 120), y: Math.round(at.y - panY() - 80), u: 'px', r: randPos().r } : randPos();
         const it = { id, type: 'img', ...pos, w: 240, z: topZ(), pinned: false };
         s.board.push(it); await renderItem(it);
       } catch { toast('Could not read that image'); }
@@ -739,7 +768,7 @@
   });
   addEventListener('dblclick', (e) => { if (s.canvas && isEmpty(e.target) && (s.pan.x || s.pan.y)) { s.pan = { x: 0, y: 0 }; applyPan(true); save(['pan']); } });
   $('#recenter').onclick = () => { s.pan = { x: 0, y: 0 }; applyPan(true); save(['pan']); };
-  $('#canvas').onchange = (e) => { s.canvas = e.target.checked; applyPan(true); save(['canvas']); };
+  $('#canvas').onchange = (e) => { s.canvas = e.target.checked; applyPan(true); placeAll(); save(['canvas']); };
 
   /* ---------- settings controls ---------- */
   $$('#mode button').forEach(b => b.onclick = () => { const prev = s.mode; s.mode = b.dataset.v; const keepAccent = s.colors.accent !== PRESETS[prev].accent; s.colors = { ...PRESETS[s.mode], accent: keepAccent ? s.colors.accent : PRESETS[s.mode].accent }; applyTheme(); save(['mode', 'colors']); });
@@ -823,7 +852,7 @@
   $('#closeSettings').onclick = $('#scrim').onclick = () => open(false);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { setMenu(false); open(false); document.activeElement?.blur(); return; }
-    if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest('input,textarea,[contenteditable]')) return;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input,textarea,[contenteditable]')) return;
     if (e.key === ',') { e.preventDefault(); open(!document.body.classList.contains('open')); return; }
     if (document.body.classList.contains('open')) return;
     if (e.key === 'n' || e.key === 'N') { e.preventDefault(); addNote(); }
@@ -963,6 +992,8 @@
     const d = await store.get([...Object.keys(DEFAULT), 'image', 'onboarding']);
     for (const k in DEFAULT) if (d[k] !== undefined) s[k] = d[k];
     if (!Array.isArray(s.board)) s.board = [];
+    s.board = s.board.filter(it => it && it.id);
+    if (s.board.map(toPx).some(Boolean)) save(['board']); // one-time move to pixel positions
     if (!Array.isArray(s.links)) s.links = structuredClone(DEFAULT.links);
     // Links can arrive from an imported backup, so re-validate them before they become hrefs.
     s.links = s.links.filter(l => l && normUrl(l.url)).map(l => ({ ...l, url: normUrl(l.url) }));
