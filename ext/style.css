@@ -195,7 +195,7 @@ body.dragging-item.move,body.dragging-item.move *{cursor:grabbing!important;user
   box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 1px 2px rgba(0,0,0,.08),0 8px 18px -4px rgba(0,0,0,.18),0 24px 38px -18px rgba(0,0,0,.35);
   transition:box-shadow .25s,transform .25s var(--ease),background .3s}
 .item.todo.drag{box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 2px 4px rgba(0,0,0,.1),0 14px 24px -6px rgba(0,0,0,.22),0 36px 50px -22px rgba(0,0,0,.45);border-radius:3px;transition:none !important}
-.item.todo input,.item.todo textarea{background:transparent;border:0;outline:none;min-width:0;font-family:inherit}
+.item.todo input,.item.todo textarea{background:transparent;border:0;outline:none;min-width:0;font-family:inherit;color:inherit}
 .td-head{display:flex;align-items:baseline;gap:calc(8px * var(--s));margin-bottom:calc(10px * var(--s))}
 .td-title{flex:1;font-size:calc(16px * var(--s));font-weight:650;letter-spacing:-.01em;cursor:text}
 .td-title::placeholder,.td-add input::placeholder{color:rgba(43,40,32,.42)}
