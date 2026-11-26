@@ -1,0 +1,11 @@
+{
+  "name": "quiet-tab",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "test:browser": "node --test tests/browser.cjs",
+    "package": "python3 scripts/package.py"
+  },
+  "engines": { "node": ">=22" },
+  "devDependencies": { "playwright-core": "1.65.1" }
+}

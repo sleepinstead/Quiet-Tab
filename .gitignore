@@ -19,3 +19,6 @@
 # Agents
 CLAUDE.md
 .claude/
+
+# Development dependencies
+/node_modules/
