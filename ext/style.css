@@ -145,12 +145,12 @@ body.dragging-item.move,body.dragging-item.move *{cursor:grabbing!important;user
 /* controls above the item */
 .ctl{position:absolute;top:-40px;right:0;z-index:2;display:flex;gap:4px;opacity:0;transform:translateY(4px);transition:.18s var(--ease)}
 .ctl::after{content:"";position:absolute;left:0;right:0;top:100%;height:14px}
-.item:hover .ctl,.item:focus-within .ctl{opacity:1;transform:none}
+.item:hover .ctl,.item:focus-within .ctl,.item.text-editing .ctl{opacity:1;transform:none}
 .ctl button{width:28px;height:28px;padding:0;border-radius:50%;border:1px solid var(--line);background:var(--surface-solid);color:var(--text);display:grid;place-items:center;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.2);transition:background .15s,color .15s,border-color .15s}
 .ctl button:hover{background:var(--bg)}
 .ctl svg{display:block;width:14px;height:14px}
 .ctl .corner svg{stroke-width:2.2}
-.ctl .pin.on{background:var(--accent);color:var(--on-accent,#fff);border-color:transparent}
+.ctl .pin.on,.text-editing .ctl .edit-text{background:var(--accent);color:var(--on-accent,#fff);border-color:transparent}
 .ctl .del{color:var(--red);background:color-mix(in srgb,var(--red) 10%,var(--surface-solid));border-color:color-mix(in srgb,var(--red) 25%,transparent)}
 .ctl .del:hover{background:var(--red);color:#fff;border-color:transparent}
 .pinmark{position:absolute;top:-7px;left:50%;width:14px;height:14px;margin-left:-7px;border-radius:50%;background:radial-gradient(circle at 35% 30%,rgba(255,255,255,.75) 0 12%,transparent 34%),radial-gradient(circle,var(--pin) 55%,color-mix(in srgb,var(--pin) 70%,#000));box-shadow:0 3px 5px rgba(0,0,0,.35),1px 6px 8px -2px rgba(0,0,0,.25);display:none}
@@ -178,12 +178,12 @@ body.dragging-item.move,body.dragging-item.move *{cursor:grabbing!important;user
 .item.note:not(.todo){--s:var(--note-scale,1);background:linear-gradient(165deg,color-mix(in srgb,var(--note) 70%,#fff) 0%,var(--note) 45%,color-mix(in srgb,var(--note) 93%,#000) 100%);color:#2b2820;border-radius:3px;padding:calc(26px * var(--s)) calc(22px * var(--s)) calc(22px * var(--s));aspect-ratio:1/1;display:flex;flex-direction:column;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 1px 1px rgba(0,0,0,.12),0 6px 12px -4px rgba(0,0,0,.22),0 22px 36px -18px rgba(0,0,0,.5);transition:box-shadow .25s,transform .25s var(--ease),background .3s}
 .item.note:not(.todo).drag{box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 2px 2px rgba(0,0,0,.1),0 14px 22px -6px rgba(0,0,0,.25),0 36px 50px -22px rgba(0,0,0,.55);transition:none !important}
-.item.note:not(.todo) [contenteditable]{outline:none;font-size:calc(15px * var(--s));font-weight:500;line-height:1.6;letter-spacing:-.005em;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;cursor:text;user-select:text;white-space:pre-wrap;word-break:break-word;scrollbar-width:thin;scrollbar-color:rgba(43,40,32,.2) transparent}
-.item.note:not(.todo) [contenteditable]::-webkit-scrollbar{width:4px}
-.item.note:not(.todo) [contenteditable]::-webkit-scrollbar-track{background:transparent}
-.item.note:not(.todo) [contenteditable]::-webkit-scrollbar-thumb{background:rgba(43,40,32,.2);border-radius:4px}
-.item.note:not(.todo) [contenteditable]:not(:focus){cursor:inherit}
-.item.note:not(.todo) [contenteditable]:empty::before{content:"Click to write…";color:rgba(43,40,32,.38);font-weight:400}
+.item.note:not(.todo) .note-text{outline:none;font-size:calc(15px * var(--s));font-weight:500;line-height:1.6;letter-spacing:-.005em;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;white-space:pre-wrap;word-break:break-word;scrollbar-width:thin;scrollbar-color:rgba(43,40,32,.2) transparent}
+.item.note:not(.todo) .note-text::-webkit-scrollbar{width:4px}
+.item.note:not(.todo) .note-text::-webkit-scrollbar-track{background:transparent}
+.item.note:not(.todo) .note-text::-webkit-scrollbar-thumb{background:rgba(43,40,32,.2);border-radius:4px}
+.item.note:not(.todo) .note-text[contenteditable="plaintext-only"]{cursor:text;user-select:text}
+.item.note:not(.todo) .note-text[contenteditable="false"]:empty::before{content:"Select Edit to write…";color:rgba(43,40,32,.38);font-weight:400}
 .pal{position:absolute;left:-38px;top:0;z-index:3;display:flex;flex-direction:column;gap:6px;padding:7px 5px;border-radius:20px;background:var(--surface-solid);border:1px solid var(--line);box-shadow:0 4px 12px rgba(0,0,0,.2);opacity:0;transform:translateX(4px);transition:.18s var(--ease)}
 .item:is(.note,.todo):hover .pal,.item:is(.note,.todo):focus-within .pal{opacity:1;transform:none}
 .pal button{width:16px;height:16px;border-radius:50%;padding:0;border:1px solid rgba(0,0,0,.15);cursor:pointer;transition:transform .15s}
@@ -210,6 +210,7 @@ body.dragging-item.move,body.dragging-item.move *{cursor:grabbing!important;user
 .td-list li{display:flex;align-items:flex-start;gap:calc(9px * var(--s));padding:calc(4px * var(--s)) calc(2px * var(--s));border-radius:calc(7px * var(--s));transition:background .15s}
 .td-list li:hover{background:rgba(43,40,32,.05)}
 .td-list li textarea,.td-list li input{flex:1;min-width:0;display:block;font-family:inherit;font-size:calc(14px * var(--s));line-height:1.45;cursor:text;transition:color .2s;resize:none;overflow:hidden;field-sizing:content;word-break:break-word;overflow-wrap:break-word;white-space:pre-wrap;padding:0;margin:0}
+.item.todo :is(input,textarea):read-only,.item.todo input:disabled{pointer-events:none;caret-color:transparent}
 .td-check{flex:none;width:calc(18px * var(--s));height:calc(18px * var(--s));margin-top:calc(1px * var(--s));border-radius:calc(6px * var(--s));border:calc(1.5px * var(--s)) solid rgba(43,40,32,.4);background:rgba(255,255,255,.35);display:grid;place-items:center;cursor:pointer;padding:0;color:transparent;transition:background .2s,border-color .2s,transform .2s var(--spring)}
 .td-check svg{width:calc(11px * var(--s));height:calc(11px * var(--s))}
 .td-check:hover{border-color:rgba(43,40,32,.7)}
@@ -219,6 +220,7 @@ body.dragging-item.move,body.dragging-item.move *{cursor:grabbing!important;user
 .td-list li.done textarea,.td-list li.done input{color:rgba(43,40,32,.42);text-decoration:line-through;text-decoration-color:rgba(43,40,32,.35)}
 .td-x{flex:none;width:calc(20px * var(--s));height:calc(20px * var(--s));margin-top:0;border-radius:calc(6px * var(--s));border:0;background:transparent;color:rgba(43,40,32,.5);display:grid;place-items:center;cursor:pointer;opacity:0;padding:0;transition:opacity .15s,background .15s,color .15s}
 .td-x svg{width:calc(11px * var(--s));height:calc(11px * var(--s))}
+.item.todo:not(.text-editing) .td-x{visibility:hidden}
 .td-list li:hover .td-x,.td-list li:focus-within .td-x{opacity:1}
 .td-x:hover{background:rgba(229,72,77,.14);color:#c8343a}
 .td-add{display:flex;align-items:center;gap:calc(9px * var(--s));padding:calc(6px * var(--s)) calc(2px * var(--s)) calc(2px * var(--s));margin-top:calc(2px * var(--s));color:rgba(43,40,32,.45);cursor:text}
@@ -226,7 +228,7 @@ body.dragging-item.move,body.dragging-item.move *{cursor:grabbing!important;user
 .td-add input{flex:1;font-size:calc(14px * var(--s))}
 .td-clear{align-self:flex-start;margin-top:calc(8px * var(--s));padding:calc(3px * var(--s)) calc(8px * var(--s));border-radius:calc(6px * var(--s));border:0;background:rgba(43,40,32,.07);font-size:calc(11.5px * var(--s));font-weight:500;color:rgba(43,40,32,.65);cursor:pointer;transition:background .15s}
 .td-clear:hover{background:rgba(43,40,32,.13)}
-.td-bar[hidden],.td-clear[hidden]{display:none}
+.td-bar[hidden],.td-clear[hidden],.item.todo:not(.text-editing) .td-clear{display:none}
 
 /* ===== overlays ===== */
 #drop{position:fixed;inset:12px;z-index:20;border:2px dashed var(--accent);border-radius:24px;display:grid;place-items:center;background:color-mix(in srgb,var(--accent) 8%,transparent);opacity:0;pointer-events:none;transition:opacity .2s}

@@ -8,6 +8,7 @@
   const { DEFAULT, PRESETS, normalizeSettings, normUrl, imageDataBlob } = QuietTabState;
   let s = structuredClone(DEFAULT);
   let baseline = normalizeSettings({});
+  let activeTextEdit;
   const dirty = new Set();
   let saveTimer, writing = 0, writeQueue = Promise.resolve(), loaded = false;
   const inFlight = new Set();
@@ -52,7 +53,10 @@
       } catch { /* The asynchronous write can still succeed if the fast cache is full. */ }
     }
   }
-  window.addEventListener('pagehide', persistOnLeave);
+  window.addEventListener('pagehide', () => {
+    activeTextEdit?.finish(false);
+    persistOnLeave();
+  });
 
   const urls = new Map();
   function urlFor(key) {
@@ -112,7 +116,7 @@
       if (incoming.generation !== s.generation) { location.reload(); return; }
       if (dirty.size || writing) { syncPending = true; return; }
       // Defer replacing an active editor until its composition/gesture has finished.
-      const editingBoard = document.activeElement?.closest('#board') || document.body.classList.contains('dragging-item');
+      const editingBoard = document.activeElement?.closest('#board') || activeTextEdit || document.body.classList.contains('dragging-item');
       let changed = false;
       for (const key of Object.keys(DEFAULT)) {
         if (key === 'board' && editingBoard || key === 'pan' && document.body.classList.contains('panning')
@@ -398,12 +402,12 @@
         if (els.get(it.id) !== el) return; // removed while loading
         if (u) img.src = u; else el.classList.add('missing');
       }
-      else if (it.type === 'todo') buildTodo(el, it);
-      else {
-        const t = document.createElement('div'); t.contentEditable = 'plaintext-only'; t.setAttribute('role', 'textbox'); t.setAttribute('aria-multiline', 'true'); t.setAttribute('aria-label', 'Sticky note'); t.spellcheck = false; t.textContent = it.text || '';
+      let commitTaskDraft;
+      if (it.type === 'todo') commitTaskDraft = buildTodo(el, it);
+      else if (it.type === 'note') {
+        const t = document.createElement('div'); t.className = 'note-text'; t.contentEditable = 'false'; t.setAttribute('aria-readonly', 'true'); t.setAttribute('role', 'textbox'); t.setAttribute('aria-multiline', 'true'); t.setAttribute('aria-label', 'Sticky note'); t.spellcheck = false; t.textContent = it.text || '';
         t.addEventListener('input', () => { it.text = t.innerText; saveBoard(); });
-        t.addEventListener('pointerdown', e => { if (document.activeElement === t) e.stopPropagation(); });
-        t.addEventListener('keydown', e => e.stopPropagation());
+        t.addEventListener('pointerdown', e => { if (t.isContentEditable) e.stopPropagation(); });
         el.append(t);
       }
       const mark = document.createElement('span'); mark.className = 'pinmark';
@@ -424,6 +428,7 @@
         const sq = svgBtn('Toggle corners', '', () => { it.square = !it.square; sync(it); saveBoard(); }, 'corner');
         ctl.append(sq);
       }
+      if (it.type !== 'img') addTextEditControl(el, ctl, commitTaskDraft);
       ctl.append(pin, del);
       const rs = document.createElement('span'); rs.className = 'rs'; rs.title = it.type === 'todo' ? 'Scale (double-click to reset)' : 'Resize (double-click to reset)'; rs.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
       const rot = document.createElement('span'); rot.className = 'rot'; rot.title = 'Rotate (Shift to snap, double-click to reset)';
@@ -614,29 +619,25 @@
         el.classList.remove('drag', mode);
         document.body.classList.remove('dragging-item', mode);
         saveBoard();
-        if (!moved) {
-          if (mode === 'move' && it.type === 'note') {
-            editAt(el, sx, sy);
-          } else if (mode !== 'move') {
-            const now = Date.now();
-            if (now - lastHandleClick.time < 450 && lastHandleClick.mode === mode && lastHandleClick.id === it.id) {
-              lastHandleClick = { time: 0, mode: '', id: '' };
-              if (mode === 'rotate') {
-                it.r = 0;
-                sync(it);
-                saveBoard();
-                toast('Reset rotation');
-              } else if (mode === 'resize') {
-                if (it.type === 'todo') { it.scale = 1; it.w = 260; }
-                else if (it.type === 'note') { it.w = 230; it.scale = 1; }
-                else if (it.type === 'img') { it.w = 240; }
-                sync(it);
-                saveBoard();
-                toast('Reset size');
-              }
-            } else {
-              lastHandleClick = { time: now, mode, id: it.id };
+        if (!moved && mode !== 'move') {
+          const now = Date.now();
+          if (now - lastHandleClick.time < 450 && lastHandleClick.mode === mode && lastHandleClick.id === it.id) {
+            lastHandleClick = { time: 0, mode: '', id: '' };
+            if (mode === 'rotate') {
+              it.r = 0;
+              sync(it);
+              saveBoard();
+              toast('Reset rotation');
+            } else if (mode === 'resize') {
+              if (it.type === 'todo') { it.scale = 1; it.w = 260; }
+              else if (it.type === 'note') { it.w = 230; it.scale = 1; }
+              else if (it.type === 'img') { it.w = 240; }
+              sync(it);
+              saveBoard();
+              toast('Reset size');
             }
+          } else {
+            lastHandleClick = { time: now, mode, id: it.id };
           }
         }
       };
@@ -656,21 +657,72 @@
       }
     });
   }
-  function editAt(el, x, y) {
-    const t = el.querySelector('[contenteditable]'); if (!t) return;
-    t.focus();
-    const r = document.caretRangeFromPoint?.(x, y);
-    const sel = getSelection();
-    if (sel) {
-      sel.removeAllRanges();
-      if (r && t.contains(r.startContainer)) sel.addRange(r);
-      else { const e = document.createRange(); e.selectNodeContents(t); e.collapse(false); sel.addRange(e); }
+  function finishEditOutsideCard(event) {
+    if (activeTextEdit && !activeTextEdit.el.contains(event.target)) activeTextEdit.finish(false);
+  }
+  document.addEventListener('pointerdown', finishEditOutsideCard, true);
+  document.addEventListener('focusin', finishEditOutsideCard);
+
+  function addTextEditControl(el, controls, commitTaskDraft) {
+    const pencil = '<path d="m14 6 4 4M4 20l4.5-1L20 7.5 16.5 4 5 15.5z"/>';
+    const check = '<path d="m5 12 4 4L19 6"/>';
+    const note = el.querySelector('.note-text');
+    const title = el.querySelector('.td-title');
+    const addTask = el.querySelector('.td-add input');
+    const button = svgBtn('Edit text', pencil, () => setEditing(!el.classList.contains('text-editing')), 'edit-text');
+
+    function setEditing(editing, restoreFocus = true) {
+      if (editing) {
+        activeTextEdit?.finish(false);
+        activeTextEdit = { el, finish: restore => setEditing(false, restore) };
+      } else {
+        activeTextEdit = null;
+        if (restoreFocus) button.focus();
+        else if (el.contains(document.activeElement)) document.activeElement.blur();
+        commitTaskDraft?.();
+      }
+      el.classList.toggle('text-editing', editing);
+      const label = editing ? 'Done editing' : 'Edit text';
+      button.title = label;
+      button.setAttribute('aria-label', label);
+      button.querySelector('svg').innerHTML = editing ? check : pencil;
+      if (note) {
+        note.contentEditable = editing ? 'plaintext-only' : 'false';
+        note.setAttribute('aria-readonly', String(!editing));
+      } else {
+        title.readOnly = !editing;
+        title.tabIndex = editing ? 0 : -1;
+        addTask.disabled = !editing;
+        el.querySelectorAll('.td-task-text').forEach(task => {
+          task.readOnly = !editing;
+          task.tabIndex = editing ? 0 : -1;
+        });
+      }
+      if (!editing) {
+        flushSave();
+        if (syncPending) scheduleSync();
+      } else if (note) {
+        note.focus();
+        getSelection()?.collapse(note, note.childNodes.length);
+      } else {
+        title.focus();
+        title.setSelectionRange(title.value.length, title.value.length);
+      }
     }
+
+    el.addEventListener('keydown', event => {
+      if (event.key !== 'Escape' || event.isComposing || !el.classList.contains('text-editing')) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setEditing(false);
+    }, true);
+    controls.append(button);
   }
   function removeItem(it) {
     s.board = s.board.filter(x => x !== it);
     const el = els.get(it.id);
     if (el) {
+      if (activeTextEdit?.el === el) activeTextEdit.finish(false);
       el.animate([{ opacity: 1, transform: getComputedStyle(el).transform }, { opacity: 0, transform: 'scale(.9)' }], { duration: 180, easing: 'ease-out' }).onfinish = () => el.remove();
       els.delete(it.id);
     }
@@ -699,10 +751,12 @@
   function buildTodo(el, it) {
     if (!Array.isArray(it.tasks)) it.tasks = [];
     const head = document.createElement('div'); head.className = 'td-head';
-    const title = document.createElement('input'); title.className = 'td-title'; title.placeholder = 'To-do'; title.setAttribute('aria-label', 'To-do list title'); title.value = it.title || ''; title.spellcheck = false;
+    const title = document.createElement('input'); title.className = 'td-title'; title.placeholder = 'To-do'; title.setAttribute('aria-label', 'To-do list title'); title.value = it.title || ''; title.readOnly = true; title.spellcheck = false;
+    title.tabIndex = -1;
     title.addEventListener('input', () => { it.title = title.value; saveBoard(); });
     title.addEventListener('keydown', (e) => {
       stop(e);
+      if (title.readOnly || e.isComposing) return;
       if (e.key === 'Enter' || e.key === 'ArrowDown') {
         e.preventDefault();
         const first = list.firstElementChild?.querySelector('.td-task-text') || add;
@@ -715,12 +769,20 @@
     const list = document.createElement('ul'); list.className = 'td-list';
     const addRow = document.createElement('label'); addRow.className = 'td-add';
     addRow.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>';
-    const add = document.createElement('input'); add.placeholder = 'Add a task'; add.setAttribute('aria-label', 'Add a task'); add.spellcheck = false; addRow.append(add);
+    const add = document.createElement('input'); add.placeholder = 'Add a task'; add.setAttribute('aria-label', 'Add a task'); add.spellcheck = false; add.disabled = true; addRow.append(add);
+    function commitTaskDraft() {
+      const text = add.value.trim();
+      add.value = '';
+      if (!text) return;
+      it.tasks.push({ id: uid(), text, done: false });
+      draw();
+      saveBoard();
+    }
     add.addEventListener('keydown', (e) => {
       stop(e);
-      if (e.key === 'Enter' && add.value.trim()) {
-        it.tasks.push({ id: uid(), text: add.value.trim(), done: false });
-        add.value = ''; draw(); saveBoard();
+      if (e.isComposing) return;
+      if (e.key === 'Enter') {
+        commitTaskDraft();
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         const lastTx = list.lastElementChild?.querySelector('.td-task-text') || title;
@@ -731,7 +793,13 @@
       }
     });
     const clear = document.createElement('button'); clear.type = 'button'; clear.className = 'td-clear'; clear.textContent = 'Clear completed';
-    clear.onclick = () => { it.tasks = it.tasks.filter(t => !t.done); draw(); saveBoard(); };
+    clear.onclick = () => {
+      if (title.readOnly) return;
+      title.focus();
+      it.tasks = it.tasks.filter(t => !t.done);
+      draw();
+      saveBoard();
+    };
     [title, add, list, clear].forEach(x => x.addEventListener('pointerdown', stop));
     addRow.addEventListener('pointerdown', stop);
     function draw(focusId, atEnd) {
@@ -741,13 +809,22 @@
         const cb = document.createElement('button'); cb.type = 'button'; cb.className = 'td-check'; cb.setAttribute('role', 'checkbox'); cb.setAttribute('aria-checked', String(!!t.done));
         cb.innerHTML = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
         cb.onclick = () => { t.done = !t.done; li.classList.toggle('done', t.done); cb.setAttribute('aria-checked', String(t.done)); meta(); saveBoard(); };
-        const tx = document.createElement('textarea'); tx.className = 'td-task-text'; tx.rows = 1; tx.setAttribute('aria-label', 'Task text'); tx.value = t.text; tx.spellcheck = false;
+        const tx = document.createElement('textarea'); tx.className = 'td-task-text'; tx.rows = 1; tx.setAttribute('aria-label', 'Task text'); tx.value = t.text; tx.readOnly = title.readOnly; tx.spellcheck = false;
+        tx.tabIndex = title.readOnly ? -1 : 0;
         const autoH = () => { tx.style.height = 'auto'; if (tx.scrollHeight > 0) tx.style.height = tx.scrollHeight + 'px'; };
         tx.addEventListener('input', () => { autoH(); t.text = tx.value; saveBoard(); });
         tx.addEventListener('keydown', (e) => {
           stop(e);
+          if (tx.readOnly || e.isComposing) return;
           const i = it.tasks.indexOf(t); // live index: the list can change without a full redraw
-          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); const n = { id: uid(), text: '', done: false }; it.tasks.splice(i + 1, 0, n); draw(n.id); saveBoard(); }
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            if (!tx.value.trim()) return;
+            const next = { id: uid(), text: '', done: false };
+            it.tasks.splice(i + 1, 0, next);
+            draw(next.id);
+            saveBoard();
+          }
           else if (e.key === 'Backspace' && !tx.value) { e.preventDefault(); it.tasks.splice(i, 1); const prev = it.tasks[i - 1]; draw(prev?.id, true); if (!prev) add.focus(); saveBoard(); }
           else if (e.key === 'ArrowUp') {
             if (tx.selectionStart === 0 && tx.selectionEnd === 0) {
@@ -770,10 +847,18 @@
           }
         });
         // Drop an empty task on blur without redrawing, so focus moving to another task survives.
-        tx.addEventListener('blur', () => { if (!t.text.trim() && it.tasks.includes(t)) { it.tasks = it.tasks.filter(x => x !== t); li.remove(); meta(); saveBoard(); } });
+        tx.addEventListener('blur', () => { if (!tx.readOnly && !t.text.trim() && it.tasks.includes(t)) { it.tasks = it.tasks.filter(x => x !== t); li.remove(); meta(); saveBoard(); } });
         const x = document.createElement('button'); x.type = 'button'; x.className = 'td-x'; x.setAttribute('aria-label', 'Delete task');
         x.innerHTML = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
-        x.onclick = () => { it.tasks = it.tasks.filter(y => y !== t); li.remove(); meta(); saveBoard(); };
+        x.onclick = () => {
+          if (title.readOnly) return;
+          const neighbor = li.nextElementSibling || li.previousElementSibling;
+          (neighbor?.querySelector('.td-x') || add).focus();
+          it.tasks = it.tasks.filter(y => y !== t);
+          li.remove();
+          meta();
+          saveBoard();
+        };
         const labelActions = () => {
           cb.setAttribute('aria-label', t.text || 'Task complete');
           x.setAttribute('aria-label', t.text ? 'Delete task: ' + t.text : 'Delete task');
@@ -782,7 +867,11 @@
         tx.addEventListener('input', labelActions);
         li.append(cb, tx, x); list.append(li);
         autoH();
-        if (t.id === focusId) requestAnimationFrame(() => { tx.focus(); if (atEnd) tx.setSelectionRange(tx.value.length, tx.value.length); });
+        if (t.id === focusId) requestAnimationFrame(() => {
+          if (tx.readOnly || !tx.isConnected) return;
+          tx.focus();
+          if (atEnd) tx.setSelectionRange(tx.value.length, tx.value.length);
+        });
       });
       meta();
     }
@@ -795,14 +884,15 @@
     }
     el.append(head, bar, list, addRow, clear);
     draw();
+    return commitTaskDraft;
   }
   function addTodo() {
     const it = { id: 'todo_' + uid(), type: 'todo', color: Object.keys(TODOS)[Math.floor(Math.random() * Object.keys(TODOS).length)], ...randPos(), w: 260, scale: 1, z: topZ(), pinned: false, title: '', tasks: [] };
-    s.board.push(it); renderItem(it).then(() => els.get(it.id)?.querySelector('.td-title')?.focus()); saveBoard(); updateStats();
+    s.board.push(it); renderItem(it).then(() => els.get(it.id)?.querySelector('.edit-text')?.focus()); saveBoard(); updateStats();
   }
   function addNote() {
     const it = { id: 'note_' + uid(), type: 'note', color: Object.keys(NOTES)[Math.floor(Math.random() * Object.keys(NOTES).length)], ...randPos(), w: 230, z: topZ(), pinned: false, text: '' };
-    s.board.push(it); renderItem(it).then(() => els.get(it.id)?.querySelector('[contenteditable]')?.focus()); saveBoard(); updateStats();
+    s.board.push(it); renderItem(it).then(() => els.get(it.id)?.querySelector('.edit-text')?.focus()); saveBoard(); updateStats();
   }
   const pickPin = () => $('#pinFile').click();
   $('#pinFile').onchange = (e) => { addImages([...e.target.files]); e.target.value = ''; };
