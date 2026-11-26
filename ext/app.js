@@ -2,54 +2,78 @@
   'use strict';
   const $ = (q) => document.querySelector(q);
   const $$ = (q) => document.querySelectorAll(q);
-  const hasChrome = typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local;
-
-  /* ---------- storage: small settings in chrome.storage, images as blobs in IndexedDB ---------- */
-  const store = {
-    get: (k) => hasChrome ? chrome.storage.local.get(k) : Promise.resolve(Object.fromEntries(k.map(x => { try { return [x, JSON.parse(localStorage.getItem(x) || 'null') ?? undefined]; } catch { return [x, undefined]; } }))),
-    set: (o) => {
-      const clean = Object.fromEntries(Object.entries(o).filter(([_, v]) => v !== undefined));
-      return hasChrome ? chrome.storage.local.set(clean) : Promise.resolve(Object.entries(clean).forEach(([k, v]) => localStorage.setItem(k, JSON.stringify(v))));
-    },
-    remove: (k) => hasChrome ? chrome.storage.local.remove(k) : Promise.resolve([].concat(k).forEach(x => localStorage.removeItem(x))),
-    clear: () => hasChrome ? chrome.storage.local.clear() : Promise.resolve(localStorage.clear())
-  };
-  let dbp;
-  const db = () => dbp ||= new Promise((res, rej) => { const r = indexedDB.open('quiettab', 1); r.onupgradeneeded = () => r.result.createObjectStore('blobs'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-  const idb = (mode, fn) => db().then(d => new Promise((res, rej) => { const t = d.transaction('blobs', mode); const q = fn(t.objectStore('blobs')); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
-  const blobs = { get: (k) => idb('readonly', s => s.get(k)), put: (k, v) => idb('readwrite', s => s.put(v, k)), del: (k) => idb('readwrite', s => s.delete(k)), clear: () => idb('readwrite', s => s.clear()) };
+  const { hasChrome, store, blobs, idb, withWriteLock, commitEdits, journalEdits } = QuietTabStorage;
 
   /* ---------- state ---------- */
-  const PRESETS = { light: { accent: '#3b5bdb', bg: '#f6f5f2', text: '#1c1c1e' }, dark: { accent: '#8ea2ff', bg: '#121214', text: '#ececee' } };
-  const DEFAULT = {
-    mode: 'light', colors: { ...PRESETS.light },
-    pattern: 'dots', patOp: 50, patSize: 22,
-    hasImg: false, overlay: true, dim: 10, blur: 0,
-    canvas: true, pan: { x: 0, y: 0 },
-    barPos: 'bottom', showBar: true, showClock: true, clockSize: 100,
-    secAccent: true,
-    h24: true, secs: true, showDate: true,
-    board: [],
-    links: [{ id: 1, name: 'Google', url: 'https://google.com' }, { id: 2, name: 'GitHub', url: 'https://github.com' }, { id: 3, name: 'YouTube', url: 'https://youtube.com' }, { id: 4, name: 'Gmail', url: 'https://mail.google.com' }]
-  };
+  const { DEFAULT, PRESETS, normalizeSettings, normUrl, imageDataBlob } = QuietTabState;
   let s = structuredClone(DEFAULT);
-  const timers = {};
-  const save = (keys, delay = 0) => { const k = keys.join(); clearTimeout(timers[k]); timers[k] = setTimeout(() => { delete timers[k]; store.set(Object.fromEntries(keys.map(x => [x, s[x]]))); }, delay); };
-  const flushSave = () => {
-    for (const [k, t] of Object.entries(timers)) {
-      clearTimeout(t);
-      delete timers[k];
-      const keys = k.split(',');
-      store.set(Object.fromEntries(keys.map(x => [x, s[x]])));
-    }
+  let baseline = normalizeSettings({});
+  const dirty = new Set();
+  let saveTimer, writing = 0, writeQueue = Promise.resolve(), loaded = false;
+  const inFlight = new Set();
+  const journaled = new WeakSet();
+  const save = (keys, delay = 0) => {
+    for (const key of keys) dirty.add(key);
+    clearTimeout(saveTimer);
+    if (delay) saveTimer = setTimeout(flushSave, delay);
+    else flushSave();
   };
-  // pagehide only: a beforeunload listener would block Chrome's back/forward cache
-  window.addEventListener('pagehide', flushSave);
-  const urls = new Map(); // blob key -> object URL (revoked on removal to free memory)
-  const urlFor = async (key) => { if (urls.has(key)) return urls.get(key); const b = await blobs.get(key).catch(() => null); if (!b) return null; const u = URL.createObjectURL(b); urls.set(key, u); return u; };
-  const dropUrl = (key) => { if (urls.has(key)) { URL.revokeObjectURL(urls.get(key)); urls.delete(key); } };
+  function flushSave() {
+    clearTimeout(saveTimer);
+    if (!dirty.size) return writeQueue;
+    const keys = [...dirty];
+    dirty.clear();
+    const edits = structuredClone(Object.fromEntries(keys.map(key => [key, s[key]])));
+    inFlight.add(keys);
+    writing++;
+    writeQueue = writeQueue.then(() => withWriteLock(async () => {
+      if (!journaled.has(keys) && !await commitEdits(s.generation, keys, baseline, edits)) { location.reload(); return; }
+      // This baseline tracks what the editor saw. Reconciliation later picks up concurrent edits.
+      Object.assign(baseline, edits);
+    })).catch(() => {
+      keys.forEach(key => dirty.add(key));
+      toast('Changes could not be saved. Check available storage.');
+    }).finally(() => {
+      writing--;
+      inFlight.delete(keys);
+      if (syncPending) scheduleSync();
+    });
+    return writeQueue;
+  }
+  function persistOnLeave() {
+    flushSave();
+    const pending = new Set();
+    for (const keys of inFlight) for (const key of keys) pending.add(key);
+    if (pending.size) {
+      try {
+        journalEdits(s.generation, [...pending], baseline, s);
+        // Recovery replays the newest edit across all queued snapshots under the same lock.
+        for (const keys of inFlight) journaled.add(keys);
+      } catch { /* The asynchronous write can still succeed if the fast cache is full. */ }
+    }
+  }
+  window.addEventListener('pagehide', persistOnLeave);
 
-  const toast = (() => { const el = document.createElement('div'); el.id = 'toast'; document.body.append(el); let t; return (m) => { el.textContent = m; el.classList.add('show'); clearTimeout(t); t = setTimeout(() => el.classList.remove('show'), 1800); }; })();
+  const urls = new Map();
+  function urlFor(key) {
+    if (!urls.has(key)) {
+      const entry = {};
+      entry.promise = blobs.get(key).then(blob => {
+        if (urls.get(key) !== entry || !(blob instanceof Blob)) return null;
+        entry.url = URL.createObjectURL(blob);
+        return entry.url;
+      }).catch(() => null);
+      urls.set(key, entry);
+    }
+    return urls.get(key).promise;
+  }
+  function dropUrl(key) {
+    const entry = urls.get(key);
+    if (entry?.url) URL.revokeObjectURL(entry.url);
+    urls.delete(key);
+  }
+
+  const toast = (() => { const el = document.createElement('div'); el.id = 'toast'; el.setAttribute('role', 'status'); document.body.append(el); let t; return (m) => { const host = document.querySelector('dialog[open]') || document.body; if (el.parentNode !== host) host.append(el); el.textContent = m; el.classList.add('show'); clearTimeout(t); t = setTimeout(() => el.classList.remove('show'), 1800); }; })();
 
   /* ---------- clock: ticks only when visible, aligned to the second/minute ---------- */
   let clockT, lastTime = '', lastDay = '', dateStr = '';
@@ -73,57 +97,81 @@
       clockT = setTimeout(tick, delay);
     }
   }
+  let syncPending = false, syncing = false, syncTimer;
+  function scheduleSync() {
+    syncPending = true;
+    clearTimeout(syncTimer);
+    if (loaded && !document.hidden) syncTimer = setTimeout(syncStorage, 20);
+  }
   async function syncStorage() {
-    if (document.activeElement && document.activeElement.matches('input, textarea, [contenteditable]')) return;
-    if (Object.keys(timers).length) return; // local edits not yet written; don't clobber them
+    if (syncing || dirty.size || writing || !loaded || document.hidden) return;
+    syncing = true;
+    syncPending = false;
     try {
-      const d = await store.get([...Object.keys(DEFAULT)]);
-      let changed = false, boardChanged = false;
-      for (const k in DEFAULT) {
-        if (d[k] === undefined || JSON.stringify(d[k]) === JSON.stringify(s[k])) continue;
-        if (k !== 'board') { s[k] = d[k]; changed = true; continue; }
-        if (!Array.isArray(d.board)) continue;
-        d.board.forEach(toPx);
-        if (JSON.stringify(d.board) === JSON.stringify(s.board)) continue;
-        changed = boardChanged = true;
-        // Item elements hold closures over their item objects, so keep unchanged objects
-        // and rebuild changed ones; otherwise later edits would mutate orphaned objects.
-        const old = new Map(s.board.map(i => [i.id, i]));
-        s.board = d.board.map(n => {
-          const o = old.get(n.id);
-          if (o && JSON.stringify(o) === JSON.stringify(n)) return o;
-          if (o) { els.get(n.id)?.remove(); els.delete(n.id); }
-          return n;
+      const incoming = normalizeSettings(await store.get(Object.keys(DEFAULT)));
+      if (incoming.generation !== s.generation) { location.reload(); return; }
+      if (dirty.size || writing) { syncPending = true; return; }
+      // Defer replacing an active editor until its composition/gesture has finished.
+      const editingBoard = document.activeElement?.closest('#board') || document.body.classList.contains('dragging-item');
+      let changed = false;
+      for (const key of Object.keys(DEFAULT)) {
+        if (key === 'board' && editingBoard || key === 'pan' && document.body.classList.contains('panning')
+            || key === 'links' && editing !== null) {
+          if (JSON.stringify(incoming[key]) !== JSON.stringify(baseline[key])) syncPending = true;
+          continue;
+        }
+        if (JSON.stringify(incoming[key]) === JSON.stringify(baseline[key])) continue;
+        baseline[key] = structuredClone(incoming[key]);
+        if (JSON.stringify(incoming[key]) === JSON.stringify(s[key])) continue;
+        changed = true;
+        if (key === 'bgKey') dropUrl(s.bgKey);
+        if (key !== 'board') { s[key] = incoming[key]; continue; }
+        const old = new Map(s.board.map(item => [item.id, item]));
+        s.board = incoming.board.map(item => {
+          const previous = old.get(item.id);
+          old.delete(item.id);
+          toPx(item);
+          if (previous && JSON.stringify(previous) === JSON.stringify(item)) return previous;
+          els.get(item.id)?.remove();
+          els.delete(item.id);
+          return item;
         });
-      }
-      if (!changed) return;
-      applyTheme(); applyBar(); applyClockOpts(); renderLinks(); applyBg();
-      if (boardChanged) {
-        const ids = new Set(s.board.map(i => i.id));
-        for (const [id, el] of els) if (!ids.has(id)) { el.remove(); els.delete(id); dropUrl(id); }
-        s.board.forEach(it => { if (!els.has(it.id)) renderItem(it, false); });
+        for (const id of old.keys()) { els.get(id)?.remove(); els.delete(id); dropUrl(id); }
+        s.board.forEach(item => { if (!els.has(item.id)) renderItem(item, false); });
         updateStats();
       }
-      applyPan(false);
-    } catch {}
+      if (changed) { applyTheme(); applyBar(); applyClockOpts(); renderLinks(); applyBg(); applyPan(false); placeAll(); }
+    } catch { toast('Could not load saved changes'); }
+    finally { syncing = false; }
   }
+  if (hasChrome) chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && Object.keys(changes).some(key => Object.hasOwn(DEFAULT, key))) scheduleSync();
+  });
+  else window.addEventListener('storage', e => { if (e.key === null || Object.hasOwn(DEFAULT, e.key)) scheduleSync(); });
+  document.addEventListener('focusout', () => { if (syncPending) scheduleSync(); });
+  window.addEventListener('pageshow', () => { if (loaded) scheduleSync(); });
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      clearTimeout(clockT);
-      flushSave(); // write pending edits so other tabs see them
-    } else {
-      tick();
-      syncStorage();
-    }
+    if (document.hidden) { clearTimeout(clockT); persistOnLeave(); }
+    else { tick(); scheduleSync(); }
   });
 
   /* ---------- image helpers ---------- */
+  function stageImage(key, image) {
+    const generation = s.generation;
+    return withWriteLock(async () => {
+      const latest = await store.get(['generation']);
+      if ((latest.generation || '') !== generation) return false;
+      await blobs.put(key, image);
+      return true;
+    });
+  }
   async function shrink(file, max, type = 'image/jpeg') {
+    if (file.size > 64 * 1024 * 1024) throw new Error('Image exceeds 64 MiB');
     const bmp = await createImageBitmap(file);
-    if (!bmp.width || !bmp.height) { bmp.close(); throw new Error('Invalid image dimensions'); }
+    if (!bmp.width || !bmp.height || bmp.width * bmp.height > 100_000_000) { bmp.close(); throw new Error('Invalid image dimensions'); }
     const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
-    const c = document.createElement('canvas'); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
-    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height); bmp.close();
+    const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(bmp.width * k)); c.height = Math.max(1, Math.round(bmp.height * k));
+    try { c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height); } finally { bmp.close(); }
     const out = await new Promise(r => c.toBlob(r, type, 0.86));
     c.width = c.height = 0; // release canvas memory
     if (!out) throw new Error('Blob encoding failed');
@@ -132,19 +180,36 @@
   const isPng = (f) => /png|gif|webp|svg/.test(f.type);
 
   /* ---------- theme & background ---------- */
+  function markChoice(button, selected) {
+    button.classList.toggle('on', selected);
+    button.setAttribute('aria-pressed', String(selected));
+  }
+  function enableControls(group, enabled) {
+    group.classList.toggle('off', !enabled);
+    group.querySelectorAll('button,input').forEach(control => { control.disabled = !enabled; });
+  }
   function applyTheme() {
     const r = document.documentElement.style;
     r.setProperty('--accent', s.colors.accent); r.setProperty('--bg', s.colors.bg); r.setProperty('--text', s.colors.text);
+    const [red, green, blue] = s.colors.accent.slice(1).match(/../g).map(pair => {
+      const value = parseInt(pair, 16) / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    r.setProperty('--on-accent', luminance > 0.179 ? '#000' : '#fff');
     r.colorScheme = s.mode;
+    r.backgroundColor = s.colors.bg;
     try { localStorage.setItem('qt-mode', s.mode); localStorage.setItem('qt-bg', s.colors.bg); } catch (e) {}
     [['#cAccent', 'accent'], ['#cBg', 'bg'], ['#cText', 'text']].forEach(([q, k]) => { $(q).value = s.colors[k]; const hx = $(q + 'Hex'); if (document.activeElement !== hx) { hx.value = s.colors[k].slice(1).toUpperCase(); hx.parentElement.classList.remove('bad'); } });
-    $$('#presets button').forEach(b => b.classList.toggle('on', b.dataset.c.toLowerCase() === s.colors.accent.toLowerCase()));
-    $$('#mode button').forEach(b => b.classList.toggle('on', b.dataset.v === s.mode));
+    $$('#presets button').forEach(b => markChoice(b, b.dataset.c.toLowerCase() === s.colors.accent.toLowerCase()));
+    $$('#mode button').forEach(b => markChoice(b, b.dataset.v === s.mode));
   }
+  let bgRender = 0;
   async function applyBg() {
+    const revision = ++bgRender;
     const img = $('#bgimg'), pat = $('#pattern');
-    const url = s.hasImg ? await urlFor('bg') : null;
-    if (s.hasImg && !url) s.hasImg = false;
+    const url = s.hasImg ? await urlFor(s.bgKey) : null;
+    if (revision !== bgRender) return;
     img.style.backgroundImage = url ? `url("${url}")` : '';
     img.classList.toggle('on', !!url);
     img.style.setProperty('--dim', s.dim / 100);
@@ -155,8 +220,8 @@
     pat.className = showPat ? s.pattern : '';
     pat.style.setProperty('--pat-op', s.patOp / 100);
     pat.style.setProperty('--ps', s.patSize + 'px');
-    $$('#pattern-seg button').forEach(b => b.classList.toggle('on', b.dataset.v === s.pattern));
-    ['#patOpRow', '#patSizeRow'].forEach(q => $(q).classList.toggle('off', s.pattern === 'plain'));
+    $$('#pattern-seg button').forEach(b => markChoice(b, b.dataset.v === s.pattern));
+    ['#patOpRow', '#patSizeRow'].forEach(q => enableControls($(q), showPat));
     $('#patOp').value = s.patOp; $('#patOpV').textContent = s.patOp + '%';
     $('#patSize').value = s.patSize; $('#patSizeV').textContent = s.patSize;
     $('#dim').value = s.dim; $('#dimV').textContent = s.dim + '%';
@@ -172,26 +237,15 @@
     document.documentElement.classList.toggle('no-bar', !s.showBar);
     try { localStorage.setItem('qt-show-bar', s.showBar ? '1' : '0'); } catch (e) {}
     if ($('#showBar')) $('#showBar').checked = s.showBar;
-    if ($('#barOpts')) $('#barOpts').classList.toggle('off', !s.showBar);
-    $$('#barPos button').forEach(b => b.classList.toggle('on', b.dataset.v === s.barPos));
+    if ($('#barOpts')) enableControls($('#barOpts'), s.showBar);
+    $$('#barPos button').forEach(b => markChoice(b, b.dataset.v === s.barPos));
   }
   $$('#barPos button').forEach(b => b.onclick = () => { s.barPos = b.dataset.v; applyBar(); save(['barPos']); });
   if ($('#showBar')) $('#showBar').onchange = (e) => { s.showBar = e.target.checked; applyBar(); save(['showBar']); };
   function applyClockSize() { document.documentElement.style.setProperty('--cs', s.clockSize / 100); $('#clockSize').value = s.clockSize; $('#clockSizeV').textContent = s.clockSize + '%'; }
-  function applyClockOpts() { lastTime = ''; applyClockSize(); $('#showClock').checked = s.showClock; $$('.clock-opts,#clockSizeRow').forEach(e => e.classList.toggle('off', !s.showClock)); $('#h24').checked = s.h24; $('#secs').checked = s.secs; $('#showDate').checked = s.showDate; $('#secAccent').checked = s.secAccent; document.body.classList.toggle('sec-plain', !s.secAccent); tick(); }
+  function applyClockOpts() { $('#shortcutsEnabled').checked = s.shortcutsEnabled; lastTime = ''; applyClockSize(); $('#showClock').checked = s.showClock; $$('.clock-opts,#clockSizeRow').forEach(e => enableControls(e, s.showClock)); $('#h24').checked = s.h24; $('#secs').checked = s.secs; $('#showDate').checked = s.showDate; $('#secAccent').checked = s.secAccent; document.body.classList.toggle('sec-plain', !s.secAccent); tick(); }
 
   /* ---------- links ---------- */
-  const normUrl = (u) => {
-    u = (u || '').trim();
-    if (!u || /^(javascript|data|vbscript):/i.test(u)) return null;
-    if (!/^[a-z][\w+.-]*:/i.test(u)) u = 'https://' + u;
-    try {
-      const p = new URL(u);
-      return (p.protocol === 'http:' || p.protocol === 'https:' || p.protocol === 'chrome:' || p.protocol === 'edge:' || p.protocol === 'chrome-extension:') ? p.href : null;
-    } catch {
-      return null;
-    }
-  };
   const host = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return u; } };
   const icon = (l) => {
     const letter = () => {
@@ -211,7 +265,7 @@
   const svgBtn = (label, svg, fn, cls = 'icon-btn') => { const b = document.createElement('button'); b.className = cls; b.type = 'button'; b.setAttribute('aria-label', label); b.title = label; b.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${svg}</svg>`; b.onclick = fn; return b; };
   function renderLinks() {
     const bar = $('#links'); bar.replaceChildren();
-    s.links.forEach((l, i) => { const a = document.createElement('a'); a.className = 'tb-link'; a.href = l.url; a.dataset.name = (l.name || host(l.url)) + (i < 9 ? `  ·  ${i + 1}` : ''); a.setAttribute('aria-label', l.name || host(l.url)); a.append(icon(l)); bar.append(a); });
+    s.links.forEach((l, i) => { const a = document.createElement('a'); a.className = 'tb-link'; a.href = l.url; a.dataset.name = (l.name || host(l.url)) + (i < 9 ? `  ·  ${i + 1}` : ''); a.setAttribute('aria-label', l.name || host(l.url)); a.title = a.dataset.name; a.append(icon(l)); bar.append(a); });
     const list = $('#linkList'); list.replaceChildren();
     $('#linkCount').textContent = s.links.length ? s.links.length + (s.links.length === 1 ? ' link' : ' links') : '';
     if (!s.links.length) { const li = document.createElement('li'); li.className = 'empty'; li.textContent = 'No shortcuts yet'; list.append(li); }
@@ -243,7 +297,7 @@
     });
   }
   const commitLinks = () => { renderLinks(); save(['links']); };
-  function move(from, to) { if (to < 0 || to >= s.links.length || from === to) return renderLinks(); const [x] = s.links.splice(from, 1); s.links.splice(to, 0, x); commitLinks(); }
+  function move(from, to) { if (!Number.isInteger(from) || from < 0 || from >= s.links.length || !Number.isInteger(to) || to < 0 || to >= s.links.length || from === to) return renderLinks(); const [x] = s.links.splice(from, 1); s.links.splice(to, 0, x); commitLinks(); }
   let editing = null;
   function startEdit(l) { editing = l.id; $('#lName').value = l.name; $('#lUrl').value = l.url; $('#saveLink span').textContent = 'Save changes'; renderLinks(); $('#formTitle').textContent = 'Edit shortcut'; $('#cancelEdit').hidden = false; $('#lUrl').focus(); }
   function resetForm() { const was = editing; editing = null; $('#linkForm').reset(); $('#saveLink span').textContent = 'Add shortcut'; $('#formTitle').textContent = 'New shortcut'; $('#cancelEdit').hidden = true; if (was) renderLinks(); }
@@ -252,7 +306,7 @@
     e.preventDefault();
     const url = normUrl($('#lUrl').value); if (!url) { $('#lUrl').setCustomValidity('Enter a valid URL'); $('#lUrl').reportValidity(); return; }
     const name = $('#lName').value.trim() || host(url);
-    if (editing) Object.assign(s.links.find(l => l.id === editing), { name, url }); else s.links.push({ id: Date.now(), name, url });
+    if (editing) Object.assign(s.links.find(l => l.id === editing), { name, url }); else s.links.push({ id: crypto.randomUUID(), name, url });
     resetForm(); commitLinks();
   };
   $('#lUrl').oninput = (e) => e.target.setCustomValidity('');
@@ -275,7 +329,7 @@
   $('#dlgForm').addEventListener('submit', (e) => {
     const url = normUrl(dUrl.value);
     if (!url) { e.preventDefault(); dUrl.setCustomValidity('Enter a valid URL'); dUrl.reportValidity(); return; }
-    s.links.push({ id: Date.now(), name: dName.value.trim() || host(url), url }); commitLinks();
+    s.links.push({ id: crypto.randomUUID(), name: dName.value.trim() || host(url), url }); commitLinks();
     toast('Added ' + (dName.value.trim() || host(url)));
   });
 
@@ -325,10 +379,14 @@
     let el = els.get(it.id);
     if (!el) {
       el = document.createElement('div'); el.className = 'item ' + (it.type === 'todo' ? 'note todo' : it.type);
+      el.tabIndex = 0;
+      el.setAttribute('role', 'group');
+      el.setAttribute('aria-label', { img: 'Board image', note: 'Sticky note', todo: 'To-do list' }[it.type]);
+      el.setAttribute('aria-describedby', 'boardKeys');
       // Register right away so a second render call (e.g. a storage sync during an
       // image load) can't create a duplicate element for the same item.
       els.set(it.id, el);
-      if (i !== false) {
+      if (i !== false && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
         el.classList.add('item-enter');
         el.style.setProperty('--item-delay', typeof i === 'number' && i >= 0 ? Math.min(0.42, +(0.06 + i * 0.05).toFixed(2)) + 's' : '0s');
         const endEnter = (e) => { if (e.target !== el || e.animationName !== 'item-rise') return; el.classList.remove('item-enter'); el.removeEventListener('animationend', endEnter); };
@@ -342,7 +400,7 @@
       }
       else if (it.type === 'todo') buildTodo(el, it);
       else {
-        const t = document.createElement('div'); t.contentEditable = 'plaintext-only'; t.spellcheck = false; t.textContent = it.text || '';
+        const t = document.createElement('div'); t.contentEditable = 'plaintext-only'; t.setAttribute('role', 'textbox'); t.setAttribute('aria-multiline', 'true'); t.setAttribute('aria-label', 'Sticky note'); t.spellcheck = false; t.textContent = it.text || '';
         t.addEventListener('input', () => { it.text = t.innerText; saveBoard(); });
         t.addEventListener('pointerdown', e => { if (document.activeElement === t) e.stopPropagation(); });
         t.addEventListener('keydown', e => e.stopPropagation());
@@ -382,7 +440,7 @@
   const NOTES = { yellow: '#fff3a3', pink: '#ffc9d9', green: '#c8f0b8', blue: '#bfe3ff', orange: '#ffd6a5', purple: '#e3d1ff' };
   const TODOS = { slate: '#e2e5ea', sky: '#c8ddf6', mint: '#c5ecd8', sand: '#ebdccb', lavender: '#dfd3f4', blush: '#f3ced7' };
   const colorsFor = (it) => it.type === 'todo' ? TODOS : NOTES;
-  const noteColor = (it) => { const pal = colorsFor(it); return pal[it.color] ? it.color : Object.keys(pal)[Math.abs([...String(it.id || '')].reduce((h, c) => (h * 17 + c.charCodeAt(0)) | 0, 7)) % Object.keys(pal).length]; };
+  const noteColor = (it) => { const pal = colorsFor(it); return Object.hasOwn(pal, it.color) ? it.color : Object.keys(pal)[Math.abs([...String(it.id || '')].reduce((h, c) => (h * 17 + c.charCodeAt(0)) | 0, 7)) % Object.keys(pal).length]; };
   function sync(it) {
     const el = els.get(it.id);
     if (!el) return;
@@ -408,7 +466,7 @@
     el.style.zIndex = it.z || 1;
     el.style.setProperty('--r', (it.r || 0) + 'deg');
     el.style.setProperty('--pin', pinColor(it.id));
-    if (it.type !== 'img') { const pal = colorsFor(it); const c = noteColor(it); el.style.setProperty('--note', pal[c]); el.querySelectorAll('.pal button').forEach(b => b.classList.toggle('on', b.dataset.c === c)); }
+    if (it.type !== 'img') { const pal = colorsFor(it); const c = noteColor(it); el.style.setProperty('--note', pal[c]); el.querySelectorAll('.pal button').forEach(b => markChoice(b, b.dataset.c === c)); }
     el.classList.toggle('pinned', !!it.pinned);
     if (it.type === 'img') {
       el.classList.toggle('square', !!it.square);
@@ -420,12 +478,33 @@
     }
     const pinBtn = el.querySelector('.pin');
     if (pinBtn) {
-      pinBtn.classList.toggle('on', !!it.pinned);
+      markChoice(pinBtn, !!it.pinned);
       pinBtn.title = it.pinned ? 'Unpin' : 'Pin';
     }
   }
   let lastHandleClick = { time: 0, mode: '', id: '' };
   function dragify(el, it) {
+    el.addEventListener('keydown', e => {
+      if (e.target !== el || it.pinned || e.ctrlKey || e.altKey || e.metaKey) return;
+      const direction = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+      if (!direction) return;
+      e.preventDefault();
+      const [dx, dy] = direction;
+      if (!e.shiftKey) {
+        toPx(it);
+        const x = el.offsetLeft + dx * 10, y = el.offsetTop + dy * 10;
+        it.x = s.canvas ? x : clamp(x, -el.offsetWidth * 0.6, innerWidth - 40);
+        it.y = s.canvas ? y : clamp(y, -20, innerHeight - 40);
+      } else if (dx) {
+        it.r = ((it.r + dx * 15 + 540) % 360) - 180;
+      } else if (it.type === 'todo') {
+        it.scale = clamp(it.scale - dy * 0.1, 0.5, 3);
+      } else {
+        it.w = clamp(it.w - dy * 10, it.type === 'note' ? 140 : 100, 1000);
+      }
+      sync(it);
+      saveBoard();
+    });
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       it.z = topZ(); el.style.zIndex = it.z;
@@ -595,7 +674,7 @@
       el.animate([{ opacity: 1, transform: getComputedStyle(el).transform }, { opacity: 0, transform: 'scale(.9)' }], { duration: 180, easing: 'ease-out' }).onfinish = () => el.remove();
       els.delete(it.id);
     }
-    if (it.type === 'img') { dropUrl(it.id); blobs.del(it.id).catch(() => {}); }
+    if (it.type === 'img') dropUrl(it.id);
     saveBoard();
     updateStats();
   }
@@ -604,23 +683,23 @@
       if (!f.type.startsWith('image/')) continue;
       try {
         const blob = await shrink(f, 1400, isPng(f) ? 'image/webp' : 'image/jpeg');
-        const id = 'pin_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-        await blobs.put(id, blob);
+        const id = 'pin_' + uid();
+        const wrote = await stageImage(id, blob);
+        if (!wrote) return;
         const pos = at ? { x: Math.round(at.x - panX() - 120), y: Math.round(at.y - panY() - 80), u: 'px', r: randPos().r } : randPos();
         const it = { id, type: 'img', ...pos, w: 240, z: topZ(), pinned: false };
-        s.board.push(it); await renderItem(it);
+        s.board.push(it); save(['board']); await renderItem(it);
       } catch { toast('Could not read that image'); }
     }
-    saveBoard();
     updateStats();
   }
   /* ---------- to-do lists ---------- */
-  const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const uid = () => crypto.randomUUID();
   const stop = (e) => e.stopPropagation();
   function buildTodo(el, it) {
     if (!Array.isArray(it.tasks)) it.tasks = [];
     const head = document.createElement('div'); head.className = 'td-head';
-    const title = document.createElement('input'); title.className = 'td-title'; title.placeholder = 'To-do'; title.value = it.title || ''; title.spellcheck = false;
+    const title = document.createElement('input'); title.className = 'td-title'; title.placeholder = 'To-do'; title.setAttribute('aria-label', 'To-do list title'); title.value = it.title || ''; title.spellcheck = false;
     title.addEventListener('input', () => { it.title = title.value; saveBoard(); });
     title.addEventListener('keydown', (e) => {
       stop(e);
@@ -636,7 +715,7 @@
     const list = document.createElement('ul'); list.className = 'td-list';
     const addRow = document.createElement('label'); addRow.className = 'td-add';
     addRow.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>';
-    const add = document.createElement('input'); add.placeholder = 'Add a task'; add.spellcheck = false; addRow.append(add);
+    const add = document.createElement('input'); add.placeholder = 'Add a task'; add.setAttribute('aria-label', 'Add a task'); add.spellcheck = false; addRow.append(add);
     add.addEventListener('keydown', (e) => {
       stop(e);
       if (e.key === 'Enter' && add.value.trim()) {
@@ -662,7 +741,7 @@
         const cb = document.createElement('button'); cb.type = 'button'; cb.className = 'td-check'; cb.setAttribute('role', 'checkbox'); cb.setAttribute('aria-checked', String(!!t.done));
         cb.innerHTML = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
         cb.onclick = () => { t.done = !t.done; li.classList.toggle('done', t.done); cb.setAttribute('aria-checked', String(t.done)); meta(); saveBoard(); };
-        const tx = document.createElement('textarea'); tx.className = 'td-task-text'; tx.rows = 1; tx.value = t.text; tx.spellcheck = false;
+        const tx = document.createElement('textarea'); tx.className = 'td-task-text'; tx.rows = 1; tx.setAttribute('aria-label', 'Task text'); tx.value = t.text; tx.spellcheck = false;
         const autoH = () => { tx.style.height = 'auto'; if (tx.scrollHeight > 0) tx.style.height = tx.scrollHeight + 'px'; };
         tx.addEventListener('input', () => { autoH(); t.text = tx.value; saveBoard(); });
         tx.addEventListener('keydown', (e) => {
@@ -695,6 +774,12 @@
         const x = document.createElement('button'); x.type = 'button'; x.className = 'td-x'; x.setAttribute('aria-label', 'Delete task');
         x.innerHTML = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
         x.onclick = () => { it.tasks = it.tasks.filter(y => y !== t); li.remove(); meta(); saveBoard(); };
+        const labelActions = () => {
+          cb.setAttribute('aria-label', t.text || 'Task complete');
+          x.setAttribute('aria-label', t.text ? 'Delete task: ' + t.text : 'Delete task');
+        };
+        labelActions();
+        tx.addEventListener('input', labelActions);
         li.append(cb, tx, x); list.append(li);
         autoH();
         if (t.id === focusId) requestAnimationFrame(() => { tx.focus(); if (atEnd) tx.setSelectionRange(tx.value.length, tx.value.length); });
@@ -716,32 +801,55 @@
     s.board.push(it); renderItem(it).then(() => els.get(it.id)?.querySelector('.td-title')?.focus()); saveBoard(); updateStats();
   }
   function addNote() {
-    const it = { id: 'note_' + Date.now().toString(36), type: 'note', color: Object.keys(NOTES)[Math.floor(Math.random() * Object.keys(NOTES).length)], ...randPos(), w: 230, z: topZ(), pinned: false, text: '' };
+    const it = { id: 'note_' + uid(), type: 'note', color: Object.keys(NOTES)[Math.floor(Math.random() * Object.keys(NOTES).length)], ...randPos(), w: 230, z: topZ(), pinned: false, text: '' };
     s.board.push(it); renderItem(it).then(() => els.get(it.id)?.querySelector('[contenteditable]')?.focus()); saveBoard(); updateStats();
   }
   const pickPin = () => $('#pinFile').click();
   $('#pinFile').onchange = (e) => { addImages([...e.target.files]); e.target.value = ''; };
   const menu = $('#addMenu'), addBtn = $('#addBtn');
-  if (!/Mac/.test(navigator.userAgent)) $('#addPin kbd').textContent = 'Ctrl V';
-  const setMenu = (v) => { menu.classList.toggle('open', v); addBtn.classList.toggle('active', v); addBtn.setAttribute('aria-expanded', v); };
-  addBtn.onclick = (e) => { e.stopPropagation(); setMenu(!menu.classList.contains('open')); };
+  const pasteShortcut = /Mac/.test(navigator.userAgent) ? '⌘V' : 'Ctrl+V';
+  $('#addPin kbd').textContent = pasteShortcut;
+  const menuButtons = [...menu.querySelectorAll('button')];
+  function setMenu(visible, focusIndex = 0) {
+    if (!visible && menu.contains(document.activeElement)) addBtn.focus();
+    menu.inert = !visible;
+    menu.classList.toggle('open', visible);
+    addBtn.classList.toggle('active', visible);
+    addBtn.setAttribute('aria-expanded', String(visible));
+    if (visible) menuButtons[focusIndex].focus();
+  }
+  addBtn.onclick = () => setMenu(!menu.classList.contains('open'));
+  addBtn.onkeydown = e => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    setMenu(true, e.key === 'ArrowDown' ? 0 : menuButtons.length - 1);
+  };
+  menu.onkeydown = e => {
+    const i = menuButtons.indexOf(document.activeElement);
+    const n = menuButtons.length;
+    const indices = { ArrowUp: (i + n - 1) % n, ArrowDown: (i + 1) % n, Home: 0, End: n - 1 };
+    if (Object.hasOwn(indices, e.key)) {
+      e.preventDefault();
+      menuButtons[indices[e.key]].focus();
+    } else if (e.key === 'Tab') setMenu(false);
+  };
   document.addEventListener('pointerdown', (e) => { if (menu.classList.contains('open') && !e.target.closest('.add-wrap')) setMenu(false); });
   $('#addPin').onclick = () => { setMenu(false); pickPin(); };
   $('#addNote').onclick = () => { setMenu(false); addNote(); };
   $('#addTodo').onclick = () => { setMenu(false); addTodo(); };
   $('#addLink').onclick = () => { setMenu(false); openLinkDlg(); };
-  $('#addTodo2').onclick = addTodo;
-  $('#addPin2').onclick = pickPin; $('#addNote2').onclick = addNote;
+  $('#addTodo2').onclick = () => { open(false); addTodo(); };
+  $('#addPin2').onclick = pickPin; $('#addNote2').onclick = () => { open(false); addNote(); };
   $('#clearBoard').onclick = () => { if (!s.board.length || !confirm('Remove all pinned images and notes?')) return; [...s.board].forEach(removeItem); updateStats(); };
 
   // drag & drop and paste
   let dragDepth = 0;
   const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
-  addEventListener('dragenter', e => { if (hasFiles(e)) { dragDepth++; document.body.classList.add('dropping'); } });
+  addEventListener('dragenter', e => { if (hasFiles(e) && !document.querySelector('dialog[open]')) { dragDepth++; document.body.classList.add('dropping'); } });
   addEventListener('dragleave', e => { if (hasFiles(e) && --dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dropping'); } });
   addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
-  addEventListener('drop', e => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping'); addImages([...e.dataTransfer.files], { x: e.clientX, y: e.clientY }); });
-  addEventListener('paste', e => { if (e.target.closest?.('input,textarea,[contenteditable]')) return; const f = [...(e.clipboardData?.files || [])]; if (f.length) { e.preventDefault(); addImages(f); } });
+  addEventListener('drop', e => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping'); if (document.querySelector('dialog[open]')) return; addImages([...e.dataTransfer.files], { x: e.clientX, y: e.clientY }); });
+  addEventListener('paste', e => { if (document.querySelector('dialog[open]') || e.target.closest?.('input,textarea,[contenteditable]')) return; const f = [...(e.clipboardData?.files || [])]; if (f.length) { e.preventDefault(); addImages(f); } });
 
   /* ---------- pannable canvas ---------- */
   const pat = $('#pattern');
@@ -789,56 +897,96 @@
   [['#secAccent', 'secAccent'], ['#showClock', 'showClock'], ['#h24', 'h24'], ['#secs', 'secs'], ['#showDate', 'showDate']].forEach(([q, k]) => $(q).onchange = (e) => { s[k] = e.target.checked; applyClockOpts(); save([k]); });
   $('#clockSize').addEventListener('input', (e) => { s.clockSize = +e.target.value; applyClockSize(); save(['clockSize'], 200); });
   $('#clockSize').addEventListener('dblclick', () => { s.clockSize = 100; applyClockSize(); save(['clockSize']); });
+  let bgOperation = 0;
   $('#bgFile').onchange = async (e) => {
-    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-    try { const blob = await shrink(f, Math.min(2560, Math.max(1280, Math.round((screen.width || 1920) * (window.devicePixelRatio || 1)))), 'image/jpeg'); await blobs.put('bg', blob); dropUrl('bg'); s.hasImg = true; await applyBg(); save(['hasImg']); }
-    catch { toast('Could not use that image'); }
-  };
-  $('#clearImg').onclick = () => { dropUrl('bg'); blobs.del('bg'); s.hasImg = false; applyBg(); save(['hasImg']); };
-
-  // data: export / import / reset
-  const toDataURL = (b) => new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(b); });
-  $('#exportBtn').onclick = async () => {
-    const out = { app: 'quiet-tab', v: 2, settings: s, blobs: {} };
-    for (const k of ['bg', ...s.board.filter(i => i.type === 'img').map(i => i.id)]) { const b = await blobs.get(k); if (b) out.blobs[k] = await toDataURL(b); }
-    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(out)], { type: 'application/json' }));
-    a.download = `quiet-tab-${new Date().toISOString().slice(0, 10)}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  };
-  const cancelSaves = () => {
-    window.removeEventListener('pagehide', flushSave);
-    window.removeEventListener('beforeunload', flushSave);
-    for (const k of Object.keys(timers)) { clearTimeout(timers[k]); delete timers[k]; }
-  };
-  $('#importFile').onchange = async (e) => {
-    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    const revision = ++bgOperation;
+    const key = 'bg_' + uid();
     try {
-      const data = JSON.parse(await f.text()); if (data.app !== 'quiet-tab' || !data.settings) throw 0;
-      cancelSaves();
-      await blobs.clear();
-      for (const [k, v] of Object.entries(data.blobs || {})) {
-        try {
-          const res = await fetch(v);
-          await blobs.put(k, await res.blob());
-        } catch {
-          const arr = v.split(','), mime = arr[0].match(/:(.*?);/)?.[1] || 'image/jpeg';
-          const bstr = atob(arr[1]);
-          const u8 = new Uint8Array(bstr.length);
-          for (let i = 0; i < bstr.length; i++) u8[i] = bstr.charCodeAt(i);
-          await blobs.put(k, new Blob([u8], { type: mime }));
-        }
-      }
-      await store.clear();
-      await store.set({ ...DEFAULT, ...data.settings });
-      await store.set({ onboarding: { status: 'done' } }); // restoring a backup isn't a first run
-      location.reload();
-    } catch { toast('Not a valid Quiet Tab backup'); }
+      const size = Math.min(2560, Math.max(1280, Math.round(screen.width * devicePixelRatio)));
+      const image = await shrink(file, size, 'image/jpeg');
+      if (revision !== bgOperation) return;
+      if (!await stageImage(key, image)) return;
+      if (revision !== bgOperation) { await blobs.del(key); return; }
+      dropUrl(s.bgKey);
+      s.bgKey = key;
+      s.hasImg = true;
+      save(['bgKey', 'hasImg']);
+      await applyBg();
+    } catch { toast('Could not use that image'); }
   };
-  $('#resetAll').onclick = async () => {
-    if (!confirm('Erase all settings, shortcuts, pinned images and notes? This cannot be undone.')) return;
-    cancelSaves();
-    await store.clear();
-    await blobs.clear();
+  $('#clearImg').onclick = () => {
+    bgOperation++;
+    dropUrl(s.bgKey);
+    s.bgKey = 'bg';
+    s.hasImg = false;
+    save(['hasImg', 'bgKey']);
+    applyBg();
+  };
+
+  /* ---------- portable backups ---------- */
+  const committedSettings = async () => normalizeSettings(await store.get(Object.keys(DEFAULT)));
+
+  async function replaceData(settings, images, onboarding) {
+    await flushSave();
+    await withWriteLock(async () => {
+      const oldKeys = await idb('readonly', table => table.getAllKeys());
+      // Stage under fresh keys so interruption leaves the previous board readable.
+      await idb('readwrite', table => {
+        for (const [key, blob] of images) table.add(blob, key);
+      });
+      try {
+        await store.set({ ...settings, generation: crypto.randomUUID(), image: null, onboarding });
+      } catch (error) {
+        await idb('readwrite', table => { for (const key of images.keys()) table.delete(key); });
+        throw error;
+      }
+      // A cleanup failure only leaves unreferenced assets. The switch has committed.
+      await idb('readwrite', table => { for (const key of oldKeys) table.delete(key); })
+        .catch(error => console.warn('Quiet Tab could not reclaim unused images', error));
+    });
     location.reload();
+  }
+
+  $('#exportBtn').onclick = async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      await flushSave();
+      if (dirty.size) throw new Error('Save pending changes before exporting.');
+      const file = await withWriteLock(async () => QuietTabBackup.serialize(await committedSettings(), blobs.get));
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(file);
+      a.download = `quiet-tab-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    } catch (error) { toast(error.message || 'Could not export backup'); }
+    finally { button.disabled = false; }
+  };
+
+  $('#importFile').onchange = async event => {
+    const input = event.target;
+    const [file] = input.files;
+    input.value = '';
+    if (!file) return;
+    input.disabled = true;
+    try {
+      let backup;
+      try { backup = await QuietTabBackup.parse(file); }
+      catch { toast('Invalid or unreadable Quiet Tab backup (maximum 128 MiB)'); return; }
+      if (confirm('Replace your current settings and board with this backup?')) {
+        await replaceData(backup.settings, backup.images, { status: 'done' });
+      }
+    } catch { toast('Could not restore backup. Check available storage and try again.'); }
+    finally { input.disabled = false; }
+  };
+
+  $('#resetAll').onclick = async () => {
+    if (!confirm('Erase all settings, shortcuts, images, notes and to-do lists?')) return;
+    try { await replaceData(structuredClone(DEFAULT), new Map(), { status: 'active', step: 0 }); }
+    catch { toast('Could not reset Quiet Tab. Try again.'); }
   };
 
   /* ---------- panel & keyboard ---------- */
@@ -846,15 +994,41 @@
     $('#boardCount').textContent = s.board.length || '';
     $('#clearBoard').disabled = !s.board.length;
   }
-  const open = (v) => { if (v) updateStats(); document.body.classList.toggle('open', v); $('#panel').setAttribute('aria-hidden', !v); $('#panel').inert = !v; };
+  const panel = $('#panel');
+  function open(visible) {
+    if (panel.open === visible) return;
+    if (visible) {
+      setMenu(false);
+      updateStats();
+      panel.showModal();
+    } else {
+      panel.close();
+      (s.showBar ? $('#openSettings') : $('#cornerSettings')).focus();
+    }
+    document.body.classList.toggle('open', visible);
+  }
+  panel.addEventListener('cancel', e => { e.preventDefault(); open(false); });
+  panel.addEventListener('click', e => {
+    if (e.target !== panel) return;
+    const rect = panel.getBoundingClientRect();
+    if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) open(false);
+  });
   $('#openSettings').onclick = () => open(true);
   if ($('#cornerSettings')) $('#cornerSettings').onclick = () => open(true);
-  $('#closeSettings').onclick = $('#scrim').onclick = () => open(false);
+  $('#closeSettings').onclick = () => open(false);
+  $('#shortcutsEnabled').onchange = e => {
+    s.shortcutsEnabled = e.target.checked;
+    save(['shortcutsEnabled']);
+  };
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { setMenu(false); open(false); document.activeElement?.blur(); return; }
-    if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input,textarea,[contenteditable]')) return;
+    if (dlg.open || tourEl.open || e.isComposing || e.defaultPrevented) return;
+    if (e.key === 'Escape') {
+      if (menu.classList.contains('open')) setMenu(false);
+      return;
+    }
+    if (!s.shortcutsEnabled || e.repeat || e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input,textarea,[contenteditable]')) return;
     if (e.key === ',') { e.preventDefault(); open(!document.body.classList.contains('open')); return; }
-    if (document.body.classList.contains('open')) return;
+    if (panel.open || menu.classList.contains('open')) return;
     if (e.key === 'n' || e.key === 'N') { e.preventDefault(); addNote(); }
     else if (e.key === 't' || e.key === 'T') { e.preventDefault(); addTodo(); }
     else if (e.key === 's' || e.key === 'S') { e.preventDefault(); openLinkDlg(); }
@@ -875,7 +1049,7 @@
     const ls = (s.links.length ? s.links : DEFAULT.links).slice(0, 4);
     const tiles = ls.map((l, i) => { const h = host(l.url || ''), ch = (l.name || h || '?').trim()[0] || '?'; return `<span class="mk-tile" style="--h:${hueOf(h)}">${esc(ch.toUpperCase())}<kbd style="--i:${i}">${i + 1}</kbd></span>`; }).join(''); // same letter + hue as the real dock
     const rows = [
-      ['Image', '⌘V', 'var(--accent)', '<rect x="3.5" y="4.5" width="17" height="15" rx="3.5"/><circle cx="15.5" cy="9" r="1.4"/><path d="M3.8 16.5l4.4-4.4a1.6 1.6 0 0 1 2.3 0l5.6 5.6"/>'],
+      ['Image', pasteShortcut, 'var(--accent)', '<rect x="3.5" y="4.5" width="17" height="15" rx="3.5"/><circle cx="15.5" cy="9" r="1.4"/><path d="M3.8 16.5l4.4-4.4a1.6 1.6 0 0 1 2.3 0l5.6 5.6"/>'],
       ['Sticky note', 'N', '#d9a400', '<path d="M20.5 14.5V7A2.5 2.5 0 0 0 18 4.5H6A2.5 2.5 0 0 0 3.5 7v11A2.5 2.5 0 0 0 6 20.5h8.5z"/><path d="M14.5 20.5v-4a2 2 0 0 1 2-2h4"/>'],
       ['To-do list', 'T', '#2f9e6b', '<rect x="3.5" y="3.5" width="17" height="17" rx="3.5"/><path d="M7.5 9l1.5 1.5L12 7.5M7.5 15l1.5 1.5L12 13.5"/>'],
       ['Shortcut', 'S', '#d6336c', '<path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1"/>']
@@ -902,7 +1076,7 @@
     { key: 'done', kicker: 'Ready', next: 'Start exploring', cam: [0, 0, 600, 380], title: 'You’re <em>all set.</em>', body: 'Enjoy the quiet. Replay this tour anytime from Settings → Help.' }
   ];
   const tourEl = $('#tour'), mk = $('#mk');
-  let tourI = -1, tourPrevFocus = null, tourClock = 0, tourLeaveT = 0;
+  let tourI = -1, tourPrevFocus = null, tourClock = 0;
   TOUR.forEach((st, i) => { const b = document.createElement('button'); b.type = 'button'; b.setAttribute('aria-label', `Step ${i + 1}: ${st.kicker}`); b.onclick = () => showStep(i); $('#tourDots').append(b); });
 
   function aimCamera() {
@@ -927,10 +1101,18 @@
     $$('#tourExtra .tq-modes button').forEach(b => b.onclick = () => { $(`#mode button[data-v="${b.dataset.v}"]`).click(); renderPicker(); $(`#tourExtra .tq-modes button[data-v="${b.dataset.v}"]`).focus(); });
     $$('#tourExtra .tq-accents button').forEach(b => b.onclick = () => { const c = b.dataset.c; s.colors.accent = c; applyTheme(); save(['colors']); renderPicker(); $(`#tourExtra .tq-accents button[data-c="${c}"]`).focus(); });
   }
+  function persistOnboarding(status) {
+    const onboarding = { status, step: tourI };
+    const generation = s.generation;
+    withWriteLock(async () => {
+      const latest = await store.get(['generation']);
+      if ((latest.generation || '') === generation) await store.set({ onboarding });
+    }).catch(() => toast('Could not save tutorial progress'));
+  }
   function showStep(i) {
     tourI = Math.max(0, Math.min(i, TOUR.length - 1));
     const st = TOUR[tourI], last = tourI === TOUR.length - 1;
-    store.set({ onboarding: { status: 'active', step: tourI } });
+    persistOnboarding('active');
     tourEl.dataset.step = st.key;
     $('#tourNum').textContent = p2(tourI + 1);
     $('#tourStep').innerHTML = `${p2(tourI + 1)} <b>/ ${p2(TOUR.length)}</b> &nbsp;·&nbsp; ${st.kicker}`;
@@ -946,82 +1128,82 @@
     if (!tourEl.contains(document.activeElement) || document.activeElement.disabled) $('#tourNext').focus({ preventScroll: true });
   }
   const tickMini = () => { const t = nowParts(); $$('#mk [data-hm]').forEach(e => e.textContent = t.hm); $$('#mk [data-sec]').forEach(e => e.textContent = t.sec); };
+  function runTourClock() {
+    clearInterval(tourClock);
+    if (tourI >= 0 && !document.hidden) {
+      tickMini();
+      tourClock = setInterval(tickMini, s.secs ? 1000 : 60000);
+    }
+  }
   function startTour(step = 0) {
     setMenu(false); open(false);
-    clearTimeout(tourLeaveT); tourEl.classList.remove('leaving');
     if (tourI < 0) tourPrevFocus = document.activeElement;
     buildMini();
     tourEl.hidden = false;
+    if (!tourEl.open) tourEl.showModal();
     // Restart entrance animations when replaying.
     $$('#tour .tq, #tour .tq-veil, #tour .tq-device').forEach(e => { e.style.animation = 'none'; void e.offsetWidth; e.style.animation = ''; });
-    clearInterval(tourClock); tourClock = setInterval(tickMini, 1000);
-    document.addEventListener('keydown', onTourKey, true);
+    document.addEventListener('visibilitychange', runTourClock);
     addEventListener('resize', aimCamera);
     mk.style.transition = 'none'; showStep(step); void mk.offsetWidth; mk.style.transition = '';
+    runTourClock();
     $('#tourNext').focus({ preventScroll: true });
   }
   function endTour(status) {
     if (tourI < 0) return;
-    store.set({ onboarding: { status, step: tourI } });
+    persistOnboarding(status);
     tourI = -1; clearInterval(tourClock);
-    document.removeEventListener('keydown', onTourKey, true);
+    document.removeEventListener('visibilitychange', runTourClock);
     removeEventListener('resize', aimCamera);
-    tourEl.classList.add('leaving');
-    tourLeaveT = setTimeout(() => { tourEl.hidden = true; tourEl.classList.remove('leaving'); $('#mk').innerHTML = ''; }, 500);
+    tourEl.close(); tourEl.hidden = true; $('#mk').replaceChildren();
     if (tourPrevFocus?.isConnected && tourPrevFocus !== document.body) tourPrevFocus.focus(); else document.activeElement?.blur();
     if (status === 'skipped') toast('Tutorial skipped. Replay it from Settings → Help');
     else { const tb = $('#toolbar'); tb.classList.remove('tq-ping'); setTimeout(() => { tb.classList.add('tq-ping'); setTimeout(() => tb.classList.remove('tq-ping'), 3000); }, 450); }
   }
-  function onTourKey(e) {
-    // While the tour is open it owns the keyboard: no app shortcuts fire underneath it.
-    e.stopImmediatePropagation();
-    if (e.key === 'Escape') { e.preventDefault(); endTour('skipped'); }
-    else if (e.key === 'ArrowRight') { e.preventDefault(); $('#tourNext').click(); }
-    else if (e.key === 'ArrowLeft') { e.preventDefault(); if (tourI > 0) showStep(tourI - 1); }
-    else if (e.key === 'Tab') {
-      const f = [...$$('#tour button:not([disabled]):not([hidden])')].filter(b => b.offsetParent), a = f.indexOf(document.activeElement);
-      e.preventDefault(); f[(a + (e.shiftKey ? -1 : 1) + f.length) % f.length].focus();
-    }
-  }
+  tourEl.addEventListener('keydown', e => {
+    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+    if (e.key === 'ArrowRight') { e.preventDefault(); $('#tourNext').click(); }
+    if (e.key === 'ArrowLeft' && tourI > 0) { e.preventDefault(); showStep(tourI - 1); }
+  });
+  tourEl.addEventListener('cancel', e => { e.preventDefault(); endTour('skipped'); });
   $('#tourNext').onclick = () => tourI === TOUR.length - 1 ? endTour('done') : showStep(tourI + 1);
   $('#tourBack').onclick = () => showStep(tourI - 1);
   $('#tourSkip').onclick = () => endTour('skipped');
   $('#replayTour').onclick = () => { tourPrevFocus = null; startTour(0); };
 
   async function boot() {
-    const d = await store.get([...Object.keys(DEFAULT), 'image', 'onboarding']);
-    for (const k in DEFAULT) if (d[k] !== undefined) s[k] = d[k];
-    if (!Array.isArray(s.board)) s.board = [];
-    s.board = s.board.filter(it => it && it.id);
-    if (s.board.map(toPx).some(Boolean)) save(['board']); // one-time move to pixel positions
-    if (!Array.isArray(s.links)) s.links = structuredClone(DEFAULT.links);
-    // Links can arrive from an imported backup, so re-validate them before they become hrefs.
-    s.links = s.links.filter(l => l && normUrl(l.url)).map(l => ({ ...l, url: normUrl(l.url) }));
-    if (typeof s.colors !== 'object' || !s.colors) s.colors = { ...PRESETS.light };
-    if (typeof s.pan !== 'object' || !s.pan) s.pan = { x: 0, y: 0 };
-    if (!['bottom', 'top', 'left', 'right'].includes(s.barPos)) s.barPos = 'bottom';
-    if (d.image) { // migrate v1 base64 background into IndexedDB
-      try { await blobs.put('bg', await (await fetch(d.image)).blob()); s.hasImg = true; await store.set({ hasImg: true }); } catch {}
-      store.remove('image');
-    }
+    const d = await withWriteLock(async () => {
+      const values = await store.get([...Object.keys(DEFAULT), 'image', 'onboarding']);
+      if (values.image && !values.generation && !values.hasImg) {
+        try {
+          await blobs.put('bg', imageDataBlob(values.image));
+          await store.set({ hasImg: true });
+          values.hasImg = true;
+          await store.remove('image');
+        } catch { toast('Saved background could not be restored'); }
+      }
+      return values;
+    });
+    s = normalizeSettings(d);
+    baseline = structuredClone(s);
+    if (s.board.map(toPx).some(Boolean)) save(['board']);
     applyTheme(); applyBar(); applyClockOpts(); renderLinks(); await applyBg();
     s.board.forEach(renderItem); applyPan(false);
     // First run (or after a reset): show the tour; resume where the user left off if they closed mid-tour.
     const ob = d.onboarding;
-    if (!ob || ob.status === 'active') setTimeout(() => startTour(ob?.step || 0), 350);
+    if (!ob || ob.status === 'active') startTour(Number.isInteger(ob?.step) ? ob.step : 0);
   }
   open(false);
-  // Apply cached theme and bar synchronously before boot to prevent flash
-  try {
-    const m = localStorage.getItem('qt-mode');
-    const bg = localStorage.getItem('qt-bg');
-    if (m === 'light' || m === 'dark') s.mode = m;
-    if (bg) s.colors.bg = bg;
-    const sb = localStorage.getItem('qt-show-bar');
-    if (sb !== null) s.showBar = sb === '1';
-  } catch (e) {}
-  applyTheme();
-  applyBar();
-  tick();
-  boot().then(() => { document.body.dataset.ready = '1'; });
+  document.body.inert = true;
+  boot().then(() => {
+    loaded = true;
+    document.body.inert = false;
+    if (tourI >= 0) $('#tourNext').focus({ preventScroll: true });
+    document.body.dataset.ready = '1';
+    if (syncPending) scheduleSync();
+  }).catch(() => {
+    document.body.dataset.ready = '1';
+    tick();
+    toast('Quiet Tab could not open storage. Reopen this tab to retry.');
+  });
 })();

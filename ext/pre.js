@@ -4,7 +4,7 @@
     const bg = localStorage.getItem('qt-bg');
     const r = document.documentElement.style;
     if (m === 'light' || m === 'dark') r.colorScheme = m;
-    if (bg) {
+    if (bg && /^#[0-9a-f]{6}$/i.test(bg)) {
       r.setProperty('--bg', bg);
       r.backgroundColor = bg;
     } else if (m === 'dark') {
